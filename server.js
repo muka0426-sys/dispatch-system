@@ -5,7 +5,7 @@ import { pushText } from "./utils/line.js";
 import { parseOrderFromText } from "./utils/ai.js";
 import { createSupabase } from "./storage/supabase.js";
 
-const PORT = Number(process.env.PORT || 3000);
+const PORT = process.env.PORT || 3000;
 
 const WORKER_POLL_MS = Math.max(200, Number(process.env.WORKER_POLL_MS || 800));
 const WORKER_MAX_ATTEMPTS = Math.max(1, Number(process.env.WORKER_MAX_ATTEMPTS || 3));
@@ -15,12 +15,17 @@ const db = createSupabase();
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
+// ✅ Railway 必須要有 root
+app.get("/", (_req, res) => {
+  res.send("ok");
+});
+
 app.get("/health", (_req, res) => {
   res.status(200).json({ ok: true });
 });
 
 /**
- * 🔥 LINE webhook（唯一入口）
+ * 🔥 LINE webhook
  */
 app.post("/webhook", async (req, res) => {
   console.log("🔥 收到 LINE:", JSON.stringify(req.body));
@@ -33,7 +38,7 @@ app.post("/webhook", async (req, res) => {
       const userId = event.source?.userId;
       const text = event.message?.text;
 
-      // ✅ 先回 LINE（避免 timeout）
+      // ✅ 秒回（關鍵）
       try {
         await fetch("https://api.line.me/v2/bot/message/reply", {
           method: "POST",
@@ -55,7 +60,7 @@ app.post("/webhook", async (req, res) => {
         console.error("❌ LINE 回覆失敗:", err);
       }
 
-      // ✅ 丟 queue
+      // queue
       if (userId && text) {
         const now = new Date().toISOString();
         try {
@@ -88,7 +93,7 @@ app.post("/webhook", async (req, res) => {
 });
 
 /**
- * DB / 派單
+ * 派單邏輯
  */
 async function pickAvailableDriver() {
   return await db.pickAvailableDriver();
@@ -112,7 +117,7 @@ async function processJob(job) {
   try {
     parsed = await parseOrderFromText(messageText);
   } catch (err) {
-    console.error("🔥 AI錯誤（忽略）:", err.message);
+    console.error("🔥 AI錯誤:", err.message);
 
     parsed = {
       from: "測試起點",
@@ -152,7 +157,7 @@ async function takeOneJobAtomically() {
 }
 
 /**
- * 🔥 穩定版 worker（不會炸 container）
+ * ✅ 穩定 worker
  */
 function startWorker() {
   setInterval(async () => {
@@ -174,7 +179,7 @@ function startWorker() {
 }
 
 /**
- * 🔥 主程式（安全版）
+ * 主程式
  */
 async function main() {
   try {
