@@ -1,0 +1,19 @@
+{
+  "name": "line-dispatch-system",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "@google/generative-ai": "^0.24.1",
+    "@supabase/supabase-js": "^2.104.1",
+    "axios": "^1.12.2",
+    "dotenv": "^16.6.1",
+    "express": "^4.21.2",
+    "mongoose": "^8.18.0"
+  }
+}
