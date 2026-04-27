@@ -15,7 +15,11 @@ const db = createSupabase();
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
-// ✅ Railway 必須要有 root
+// ✅ 👉 加這兩個（搶單核心狀態）
+let currentOrder = null;
+const DRIVER_GROUP_ID = "C0227c4e4d8988002cfcd6527a43d3ad3";
+
+// ✅ Railway root
 app.get("/", (_req, res) => {
   res.send("ok");
 });
@@ -33,12 +37,19 @@ app.post("/webhook", async (req, res) => {
   const events = req.body.events || [];
 
   for (const event of events) {
-    if (event.type === "message") {
-      const replyToken = event.replyToken;
-      const userId = event.source?.userId;
-      const text = event.message?.text;
+    if (event.type !== "message" || event.message.type !== "text") continue;
 
-      // ✅ 秒回（關鍵）
+    const replyToken = event.replyToken;
+    const userId = event.source?.userId;
+    const text = event.message.text.trim();
+    const sourceType = event.source?.type;
+
+    // =========================
+    // 🧑 客人（私聊）
+    // =========================
+    if (sourceType === "user") {
+
+      // 秒回（保留你原本邏輯）
       try {
         await fetch("https://api.line.me/v2/bot/message/reply", {
           method: "POST",
@@ -60,7 +71,22 @@ app.post("/webhook", async (req, res) => {
         console.error("❌ LINE 回覆失敗:", err);
       }
 
-      // queue
+      // 👉 只有「叫車」才建立訂單
+      if (text.includes("叫車")) {
+
+        currentOrder = {
+          status: "waiting",
+          customerId: userId
+        };
+
+        // 👉 通知客人
+        await pushText(userId, "已送出叫車，正在找司機...");
+
+        // 👉 丟到司機群組
+        await pushText(DRIVER_GROUP_ID, "🚕 新訂單來了！請輸入「我」搶單");
+      }
+
+      // queue（保留你原本）
       if (userId && text) {
         const now = new Date().toISOString();
         try {
@@ -87,13 +113,61 @@ app.post("/webhook", async (req, res) => {
         }
       }
     }
+
+    // =========================
+    // 🚕 司機（群組）
+    // =========================
+    if (sourceType === "group") {
+
+      // 沒有訂單 → 不處理
+      if (!currentOrder || currentOrder.status !== "waiting") continue;
+
+      if (text === "我") {
+
+        // 👉 鎖單（避免多人）
+        currentOrder.status = "taken";
+        currentOrder.driverId = userId;
+
+        // 👉 @司機
+        await fetch("https://api.line.me/v2/bot/message/reply", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${process.env.LINE_CHANNEL_ACCESS_TOKEN}`
+          },
+          body: JSON.stringify({
+            replyToken,
+            messages: [
+              {
+                type: "text",
+                text: "@你 已派你出發",
+                mention: {
+                  mentionees: [
+                    {
+                      index: 0,
+                      length: 2,
+                      userId: userId
+                    }
+                  ]
+                }
+              }
+            ]
+          })
+        });
+
+        // 👉 通知客人
+        await pushText(currentOrder.customerId, "🚗 已幫你找到司機！");
+
+        console.log("✅ 搶單成功:", userId);
+      }
+    }
   }
 
   res.sendStatus(200);
 });
 
 /**
- * 派單邏輯
+ * 派單邏輯（保留）
  */
 async function pickAvailableDriver() {
   return await db.pickAvailableDriver();
@@ -142,6 +216,7 @@ async function processJob(job) {
     updated_at: now
   });
 
+  // 👉 這段先保留（未來會改成搶單結果寫回）
   const driver = await pickAvailableDriver();
 
   if (!driver) {
@@ -157,7 +232,7 @@ async function takeOneJobAtomically() {
 }
 
 /**
- * ✅ 穩定 worker
+ * worker
  */
 function startWorker() {
   setInterval(async () => {
