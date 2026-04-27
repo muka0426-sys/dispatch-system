@@ -15,7 +15,7 @@ const db = createSupabase();
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
-// ✅ 👉 加這兩個（搶單核心狀態）
+// ✅ 搶單核心狀態
 let currentOrder = null;
 const DRIVER_GROUP_ID = "C0227c4e4d8988002cfcd6527a43d3ad3";
 
@@ -49,7 +49,7 @@ app.post("/webhook", async (req, res) => {
     // =========================
     if (sourceType === "user") {
 
-      // 秒回（保留你原本邏輯）
+      // 秒回
       try {
         await fetch("https://api.line.me/v2/bot/message/reply", {
           method: "POST",
@@ -71,22 +71,20 @@ app.post("/webhook", async (req, res) => {
         console.error("❌ LINE 回覆失敗:", err);
       }
 
-      // 👉 只有「叫車」才建立訂單
+      // 👉 建立訂單
       if (text.includes("叫車")) {
 
         currentOrder = {
           status: "waiting",
-          customerId: userId
+          customerId: userId,
+          bids: []
         };
 
-        // 👉 通知客人
         await pushText(userId, "已送出叫車，正在找司機...");
-
-        // 👉 丟到司機群組
-        await pushText(DRIVER_GROUP_ID, "🚕 新訂單來了！請輸入「我」搶單");
+        await pushText(DRIVER_GROUP_ID, "🚕 新訂單：請輸入『地點 + 時間』搶單（例：三重 10）");
       }
 
-      // queue（保留你原本）
+      // queue（保留）
       if (userId && text) {
         const now = new Date().toISOString();
         try {
@@ -119,16 +117,43 @@ app.post("/webhook", async (req, res) => {
     // =========================
     if (sourceType === "group") {
 
-      // 沒有訂單 → 不處理
+      if (event.source.groupId !== DRIVER_GROUP_ID) continue;
       if (!currentOrder || currentOrder.status !== "waiting") continue;
 
-      if (text === "我") {
+      // 👉 抓時間
+      const match = text.match(/(\d+)/);
+      if (!match) continue;
 
-        // 👉 鎖單（避免多人）
+      const time = parseInt(match[1], 10);
+
+      console.log("🟡 偵測喊單:", { text, time, userId });
+
+      // ❗避免重複喊
+      const exists = currentOrder.bids.find(b => b.userId === userId);
+      if (exists) return;
+
+      currentOrder.bids.push({
+        userId,
+        time,
+        text,
+        ts: Date.now()
+      });
+
+      console.log("📊 bids:", currentOrder.bids);
+
+      // 👉 測試版：2人就決定
+      if (currentOrder.bids.length >= 2) {
+
+        const winner = currentOrder.bids.reduce((min, b) => {
+          return b.time < min.time ? b : min;
+        });
+
         currentOrder.status = "taken";
-        currentOrder.driverId = userId;
+        currentOrder.driverId = winner.userId;
 
-        // 👉 @司機
+        console.log("🏆 得標:", winner);
+
+        // 👉 @中獎司機
         await fetch("https://api.line.me/v2/bot/message/reply", {
           method: "POST",
           headers: {
@@ -140,13 +165,13 @@ app.post("/webhook", async (req, res) => {
             messages: [
               {
                 type: "text",
-                text: "@你 已派你出發",
+                text: "@司機 出發",
                 mention: {
                   mentionees: [
                     {
                       index: 0,
-                      length: 2,
-                      userId: userId
+                      length: 3,
+                      userId: winner.userId
                     }
                   ]
                 }
@@ -155,10 +180,7 @@ app.post("/webhook", async (req, res) => {
           })
         });
 
-        // 👉 通知客人
         await pushText(currentOrder.customerId, "🚗 已幫你找到司機！");
-
-        console.log("✅ 搶單成功:", userId);
       }
     }
   }
@@ -167,7 +189,7 @@ app.post("/webhook", async (req, res) => {
 });
 
 /**
- * 派單邏輯（保留）
+ * 以下保留（未來用）
  */
 async function pickAvailableDriver() {
   return await db.pickAvailableDriver();
@@ -191,8 +213,6 @@ async function processJob(job) {
   try {
     parsed = await parseOrderFromText(messageText);
   } catch (err) {
-    console.error("🔥 AI錯誤:", err.message);
-
     parsed = {
       from: "測試起點",
       to: "測試終點",
@@ -215,25 +235,12 @@ async function processJob(job) {
     created_at: now,
     updated_at: now
   });
-
-  // 👉 這段先保留（未來會改成搶單結果寫回）
-  const driver = await pickAvailableDriver();
-
-  if (!driver) {
-    await pushText(userId, "目前沒有可用司機");
-    return;
-  }
-
-  await pushText(userId, "已派單成功");
 }
 
 async function takeOneJobAtomically() {
   return await db.claimOneJob();
 }
 
-/**
- * worker
- */
 function startWorker() {
   setInterval(async () => {
     try {
@@ -253,9 +260,6 @@ function startWorker() {
   }, WORKER_POLL_MS);
 }
 
-/**
- * 主程式
- */
 async function main() {
   try {
     await db.ping();
