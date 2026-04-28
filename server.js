@@ -15,22 +15,17 @@ const db = createSupabase();
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
-// ✅ 搶單核心狀態
+// ✅ 狀態
 let currentOrder = null;
+let pendingDriver = null; // 🔥 等車卡用
+
 const DRIVER_GROUP_ID = "C0227c4e4d8988002cfcd6527a43d3ad3";
 
-// ✅ Railway root
-app.get("/", (_req, res) => {
-  res.send("ok");
-});
+// ========================
+app.get("/", (_req, res) => res.send("ok"));
+app.get("/health", (_req, res) => res.json({ ok: true }));
 
-app.get("/health", (_req, res) => {
-  res.status(200).json({ ok: true });
-});
-
-/**
- * 🔥 LINE webhook
- */
+// ========================
 app.post("/webhook", async (req, res) => {
   console.log("🔥 收到 LINE:", JSON.stringify(req.body));
 
@@ -45,142 +40,75 @@ app.post("/webhook", async (req, res) => {
     const sourceType = event.source?.type;
 
     // =========================
-    // 🧑 客人（私聊）
+    // 🧑 客人
     // =========================
     if (sourceType === "user") {
 
       // 秒回
-      try {
-        await fetch("https://api.line.me/v2/bot/message/reply", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Authorization": `Bearer ${process.env.LINE_CHANNEL_ACCESS_TOKEN}`
-          },
-          body: JSON.stringify({
-            replyToken,
-            messages: [
-              {
-                type: "text",
-                text: "我有收到你的訊息"
-              }
-            ]
-          })
-        });
-      } catch (err) {
-        console.error("❌ LINE 回覆失敗:", err);
-      }
+      await reply(replyToken, "已收到 👍");
 
-      // 👉 建立訂單
-      if (text.includes("叫車")) {
+      // 👉 直接當地址
+      currentOrder = {
+        status: "waiting",
+        customerId: userId,
+        address: text
+      };
 
-        currentOrder = {
-          status: "waiting",
-          customerId: userId,
-          bids: []
-        };
+      pendingDriver = null;
 
-        await pushText(userId, "已送出叫車，正在找司機...");
-        await pushText(DRIVER_GROUP_ID, "🚕 新訂單：請輸入『地點 + 時間』搶單（例：三重 10）");
-      }
-
-      // queue（保留）
-      if (userId && text) {
-        const now = new Date().toISOString();
-        try {
-          await db.insertJob({
-            id: crypto.randomUUID(),
-            type: "line_message",
-            status: "pending",
-            attempts: 0,
-            max_attempts: WORKER_MAX_ATTEMPTS,
-            next_run_at: null,
-            locked_at: null,
-            lock_id: null,
-            source_user_id: userId,
-            source_message_text: text,
-            raw_event: event,
-            result: null,
-            error_message: null,
-            error_stack: null,
-            created_at: now,
-            updated_at: now
-          });
-        } catch (err) {
-          console.error("❌ enqueue error:", err);
-        }
-      }
+      await pushText(
+        DRIVER_GROUP_ID,
+        `🚕 新訂單\n📍 ${text}\n\n👉 請標記BOT喊單（例：信義10）`
+      );
     }
 
     // =========================
-    // 🚕 司機（群組）
+    // 🚕 司機群
     // =========================
     if (sourceType === "group") {
 
       if (event.source.groupId !== DRIVER_GROUP_ID) continue;
       if (!currentOrder || currentOrder.status !== "waiting") continue;
 
-      // 👉 抓時間
-      const match = text.match(/(\d+)/);
-      if (!match) continue;
+      // 🔥 第一段：喊單（信義10）
+      const match = text.match(/(.+?)(\d+)/);
 
-      const time = parseInt(match[1], 10);
+      if (match && !pendingDriver) {
 
-      console.log("🟡 偵測喊單:", { text, time, userId });
+        const area = match[1];
+        const time = match[2];
 
-      // ❗避免重複喊
-      const exists = currentOrder.bids.find(b => b.userId === userId);
-      if (exists) return;
+        pendingDriver = {
+          userId,
+          area,
+          time
+        };
 
-      currentOrder.bids.push({
-        userId,
-        time,
-        text,
-        ts: Date.now()
-      });
+        console.log("🟡 收到喊單:", pendingDriver);
 
-      console.log("📊 bids:", currentOrder.bids);
+        await reply(replyToken, `已收到 ${area}${time}，請貼車卡`);
 
-      // 👉 測試版：2人就決定
-      if (currentOrder.bids.length >= 2) {
+        continue;
+      }
 
-        const winner = currentOrder.bids.reduce((min, b) => {
-          return b.time < min.time ? b : min;
-        });
+      // 🔥 第二段：車卡
+      if (pendingDriver && pendingDriver.userId === userId) {
 
         currentOrder.status = "taken";
-        currentOrder.driverId = winner.userId;
+        currentOrder.driverId = userId;
 
-        console.log("🏆 得標:", winner);
+        console.log("🚗 車卡:", text);
 
-        // 👉 @中獎司機
-        await fetch("https://api.line.me/v2/bot/message/reply", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Authorization": `Bearer ${process.env.LINE_CHANNEL_ACCESS_TOKEN}`
-          },
-          body: JSON.stringify({
-            replyToken,
-            messages: [
-              {
-                type: "text",
-                text: "@司機 出發",
-                mention: {
-                  mentionees: [
-                    {
-                      index: 0,
-                      length: 3,
-                      userId: winner.userId
-                    }
-                  ]
-                }
-              }
-            ]
-          })
-        });
+        // 👉 群組回覆
+        await reply(replyToken, "已派你出發 🚗");
 
-        await pushText(currentOrder.customerId, "🚗 已幫你找到司機！");
+        // 👉 🔥 把整段車卡轉發給客人
+        await pushText(
+          currentOrder.customerId,
+          `🚗 已為您安排司機\n\n${text}`
+        );
+
+        pendingDriver = null;
       }
     }
   }
@@ -188,9 +116,22 @@ app.post("/webhook", async (req, res) => {
   res.sendStatus(200);
 });
 
-/**
- * 以下保留（未來用）
- */
+// ========================
+async function reply(token, text) {
+  await fetch("https://api.line.me/v2/bot/message/reply", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${process.env.LINE_CHANNEL_ACCESS_TOKEN}`
+    },
+    body: JSON.stringify({
+      replyToken: token,
+      messages: [{ type: "text", text }]
+    })
+  });
+}
+
+// ========================
 async function pickAvailableDriver() {
   return await db.pickAvailableDriver();
 }
