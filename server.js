@@ -1,221 +1,220 @@
 import "dotenv/config";
-import crypto from "crypto";
 import express from "express";
 import { pushText } from "./utils/line.js";
-import { parseOrderFromText } from "./utils/ai.js";
-import { createSupabase } from "./storage/supabase.js";
+
+const app = express();
+app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 
-const WORKER_POLL_MS = Math.max(200, Number(process.env.WORKER_POLL_MS || 800));
-const WORKER_MAX_ATTEMPTS = Math.max(1, Number(process.env.WORKER_MAX_ATTEMPTS || 3));
-
-const db = createSupabase();
-
-const app = express();
-app.use(express.json({ limit: "1mb" }));
-
-// ✅ 狀態
+// ===== 狀態 =====
 let currentOrder = null;
-let pendingDriver = null; // 🔥 等車卡用
+/*
+status:
+idle → waiting → matched → arrived → onboard → done
+*/
+
+let pendingDriver = null;
+
+// 防重複
+const handledEvents = new Set();
 
 const DRIVER_GROUP_ID = "C0227c4e4d8988002cfcd6527a43d3ad3";
 
 // ========================
-app.get("/", (_req, res) => res.send("ok"));
-app.get("/health", (_req, res) => res.json({ ok: true }));
+app.get("/", (_, res) => res.send("ok"));
+app.get("/health", (_, res) => res.json({ ok: true }));
 
 // ========================
-app.post("/webhook", async (req, res) => {
-  console.log("🔥 收到 LINE:", JSON.stringify(req.body));
-
+app.post("/webhook", (req, res) => {
+  res.sendStatus(200);
   const events = req.body.events || [];
+  for (const event of events) handleEvent(event);
+});
 
-  for (const event of events) {
-    if (event.type !== "message" || event.message.type !== "text") continue;
+// ========================
+async function handleEvent(event) {
+  try {
+    if (!event.replyToken) return;
+
+    // 防重複
+    if (handledEvents.has(event.replyToken)) return;
+    handledEvents.add(event.replyToken);
+    setTimeout(() => handledEvents.delete(event.replyToken), 60000);
+
+    if (event.type !== "message" || event.message.type !== "text") return;
 
     const replyToken = event.replyToken;
     const userId = event.source?.userId;
     const text = event.message.text.trim();
     const sourceType = event.source?.type;
 
-    // =========================
-    // 🧑 客人
-    // =========================
-    if (sourceType === "user") {
-
-      // 秒回
-      await reply(replyToken, "已收到 👍");
-
-      // 👉 直接當地址
-      currentOrder = {
-        status: "waiting",
-        customerId: userId,
-        address: text
-      };
-
-      pendingDriver = null;
-
-      await pushText(
-        DRIVER_GROUP_ID,
-        `🚕 新訂單\n📍 ${text}\n\n👉 請標記BOT喊單（例：信義10）`
-      );
-    }
+    console.log("📩", sourceType, text);
 
     // =========================
     // 🚕 司機群
     // =========================
     if (sourceType === "group") {
 
-      if (event.source.groupId !== DRIVER_GROUP_ID) continue;
-      if (!currentOrder || currentOrder.status !== "waiting") continue;
+      if (event.source.groupId !== DRIVER_GROUP_ID) return;
+      if (!currentOrder) return;
 
-      // 🔥 第一段：喊單（信義10）
-      const match = text.match(/(.+?)(\d+)/);
+      // ===== 喊單 =====
+      const bidMatch = text.match(/(.+?)(\d+)/);
 
-      if (match && !pendingDriver) {
+      if (currentOrder.status === "waiting" && bidMatch && !pendingDriver) {
 
-        const area = match[1];
-        const time = match[2];
+        const time = bidMatch[2];
 
         pendingDriver = {
           userId,
-          area,
           time
         };
 
-        console.log("🟡 收到喊單:", pendingDriver);
-
-        await reply(replyToken, `已收到 ${area}${time}，請貼車卡`);
-
-        continue;
+        await reply(replyToken, `司機${time}分(抵達)\n請貼車卡`);
+        return;
       }
 
-      // 🔥 第二段：車卡
-      if (pendingDriver && pendingDriver.userId === userId) {
+      // ===== 車卡 =====
+      if (currentOrder.status === "waiting" && pendingDriver && pendingDriver.userId === userId) {
 
-        currentOrder.status = "taken";
-        currentOrder.driverId = userId;
+        currentOrder.status = "matched";
 
-        console.log("🚗 車卡:", text);
-
-        // 👉 群組回覆
         await reply(replyToken, "已派你出發 🚗");
 
-        // 👉 🔥 把整段車卡轉發給客人
         await pushText(
           currentOrder.customerId,
-          `🚗 已為您安排司機\n\n${text}`
+`🚗 已為您安排司機
+
+司機${pendingDriver.time}分抵達`
         );
 
+        // 👉 再補車卡（第二則）
+        await pushText(currentOrder.customerId, text);
+
+        return;
+      }
+
+      // ===== 到點 =====
+      if (currentOrder.status === "matched" && text.includes("到")) {
+
+        currentOrder.status = "arrived";
+
+        await reply(replyToken, "已通知客人");
+
+        await pushText(
+          currentOrder.customerId,
+`📍 司機已抵達，請準備上車`
+        );
+
+        return;
+      }
+
+      // ===== 上車 =====
+      if (currentOrder.status === "arrived" && text.includes("上")) {
+
+        currentOrder.status = "onboard";
+
+        await pushText(
+          currentOrder.customerId,
+`✅ 司機已回報您已上車
+感謝您的搭乘 🙏`
+        );
+
+        return;
+      }
+
+      return;
+    }
+
+    // =========================
+    // 🧑 客人（真人邏輯）
+    // =========================
+    if (sourceType === "user") {
+
+      // 👉 沒訂單
+      if (!currentOrder || currentOrder.status === "done") {
+
+        // 問候 / 無效
+        if (text.length <= 3 || text.includes("你好") || text.includes("叫車")) {
+          await reply(replyToken,
+`您好 👋
+請問哪裡需要車呢？
+
+請直接輸入上車地點
+例如：
+信義區松山路123號`);
+          return;
+        }
+
+        // 👉 建單（只要有地址）
+        currentOrder = {
+          status: "waiting",
+          customerId: userId,
+          address: text
+        };
+
         pendingDriver = null;
+
+        await reply(replyToken, "好的，幫您安排司機中 🚕");
+
+        // 👉 丟司機群（只會一次）
+        await pushText(
+          DRIVER_GROUP_ID,
+`🔥 RS 訂單
+
+📍 ${text}
+
+👉 請喊：信義10`
+        );
+
+        return;
+      }
+
+      // 👉 已在叫車
+      if (currentOrder.status === "waiting") {
+        await reply(replyToken, "已在幫您安排司機，請稍等 🚕");
+        return;
+      }
+
+      // 👉 已派車
+      if (currentOrder.status === "matched") {
+        await reply(replyToken, "司機正在前往中 🚗");
+        return;
+      }
+
+      // 👉 已完成
+      if (currentOrder.status === "onboard") {
+        await reply(replyToken, "祝您旅途愉快 🙏");
+        return;
       }
     }
-  }
 
-  res.sendStatus(200);
-});
+  } catch (err) {
+    console.error("❌ error:", err);
+  }
+}
 
 // ========================
 async function reply(token, text) {
-  await fetch("https://api.line.me/v2/bot/message/reply", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Authorization": `Bearer ${process.env.LINE_CHANNEL_ACCESS_TOKEN}`
-    },
-    body: JSON.stringify({
-      replyToken: token,
-      messages: [{ type: "text", text }]
-    })
-  });
+  try {
+    await fetch("https://api.line.me/v2/bot/message/reply", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${process.env.LINE_CHANNEL_ACCESS_TOKEN}`
+      },
+      body: JSON.stringify({
+        replyToken: token,
+        messages: [{ type: "text", text }]
+      })
+    });
+  } catch (err) {
+    console.error("❌ reply error:", err);
+  }
 }
 
 // ========================
-async function pickAvailableDriver() {
-  return await db.pickAvailableDriver();
-}
-
-async function markJobFailed(jobId, err) {
-  const message = err instanceof Error ? err.message : String(err);
-  await db.updateJobById(jobId, {
-    status: "failed",
-    error_message: message,
-    updated_at: new Date().toISOString()
-  });
-}
-
-async function processJob(job) {
-  const userId = job.source_user_id;
-  const messageText = job.source_message_text;
-
-  let parsed;
-
-  try {
-    parsed = await parseOrderFromText(messageText);
-  } catch (err) {
-    parsed = {
-      from: "測試起點",
-      to: "測試終點",
-      passengers: 1,
-      note: ""
-    };
-  }
-
-  const now = new Date().toISOString();
-
-  await db.insertOrder({
-    id: crypto.randomUUID(),
-    user_id: userId,
-    from_loc: parsed.from,
-    to_loc: parsed.to,
-    passengers: parsed.passengers,
-    note: parsed.note || "",
-    driver_id: null,
-    status: "created",
-    created_at: now,
-    updated_at: now
-  });
-}
-
-async function takeOneJobAtomically() {
-  return await db.claimOneJob();
-}
-
-function startWorker() {
-  setInterval(async () => {
-    try {
-      const job = await takeOneJobAtomically();
-      if (!job) return;
-
-      try {
-        await processJob(job);
-        await db.updateJobById(job.id, { status: "done" });
-      } catch (err) {
-        await markJobFailed(job.id, err);
-      }
-
-    } catch (err) {
-      console.error("❌ worker error:", err);
-    }
-  }, WORKER_POLL_MS);
-}
-
-async function main() {
-  try {
-    await db.ping();
-    console.log("✅ Connected to Supabase");
-  } catch (err) {
-    console.error("❌ Supabase 連線失敗:", err);
-  }
-
-  app.listen(PORT, "0.0.0.0", () => {
-    console.log(`🚀 Server running on ${PORT}`);
-  });
-
-  startWorker();
-}
-
-main().catch((err) => {
-  console.error("[fatal]", err);
+app.listen(PORT, () => {
+  console.log("🚀 running on", PORT);
 });
