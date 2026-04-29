@@ -15,6 +15,7 @@ waiting → matched → arrived → onboard → done
 let orders = [];
 let nextOrderSeq = 1;
 let pendingDriver = {};
+let pendingRideForm = new Set();
 
 // 防重複
 const handledEvents = new Set();
@@ -130,42 +131,49 @@ async function handleEvent(event) {
     // =========================
     if (sourceType === "user") {
       const activeOrder = getActiveOrder(userId);
-      if (!activeOrder) {
-        if (text.includes("叫車") || text.includes("你好") || text.length <= 3) {
-          await reply(replyToken, "請輸入上車地址");
-          return;
-        }
+      if (activeOrder) {
+        await reply(replyToken, "已在安排中");
+        return;
+      }
 
-        // 👉 建單（只要有地址）
-        const orderId = createOrderId();
-        const newOrder = {
-          orderId,
-          status: "waiting",
-          customerId: userId,
-          address: text,
-          createdAt: Date.now(),
-          driverId: null,
-          driverEta: null
-        };
-        orders.push(newOrder);
+      // 只有「叫車」或「表單」才進叫車流程（避免 你好 / 哈囉 誤觸發）
+      if (text.includes("叫車")) {
+        pendingRideForm.add(userId);
+        await reply(
+          replyToken,
+`❤️‍🔥雙北叫車格式❤️‍🔥
+___________________
+日期：
+時間：
+上車：
+下車：
+人數：`
+        );
+        return;
+      }
+
+      const form = parseRideForm(text);
+      if (form && (pendingRideForm.has(userId) || isRideForm(text))) {
+        pendingRideForm.delete(userId);
+
+        const order = createOrder(userId, form);
 
         await reply(replyToken, "幫你安排司機中");
 
-        // 👉 丟司機群（只會一次）
         await pushText(
           DRIVER_GROUP_ID,
-`🔥 RS 訂單
+`（${order.pickup}）
 
-🆔 ${orderId}
-📍 ${text}
-
-👉 請喊：信義10`
+❤️‍🔥______R•S______❤️‍🔥
+💛5/2直2內100💛
+300回10%🧨600回15%
+🔥900回20%🔥
+♐上車:未指定走最短♐`
         );
 
         return;
       }
 
-      await reply(replyToken, "已在安排中");
       return;
     }
 
@@ -178,6 +186,27 @@ function createOrderId() {
   const id = `RS${String(nextOrderSeq).padStart(4, "0")}`;
   nextOrderSeq += 1;
   return id;
+}
+
+function createOrder(customerId, form) {
+  const orderId = createOrderId();
+  const newOrder = {
+    orderId,
+    status: "waiting",
+    customerId,
+    address: form.pickup,
+    pickup: form.pickup,
+    dropoff: form.dropoff,
+    date: form.date || null,
+    time: form.time,
+    passengers: form.passengers || null,
+    formText: form.rawText,
+    createdAt: Date.now(),
+    driverId: null,
+    driverEta: null
+  };
+  orders.push(newOrder);
+  return newOrder;
 }
 
 function getActiveOrder(customerId) {
@@ -204,6 +233,42 @@ function getWaitingOrderByPendingDriver(driverUserId) {
 
 function getDriverOrderByStatus(driverUserId, status) {
   return orders.find((order) => order.driverId === driverUserId && order.status === status);
+}
+
+function isRideForm(text) {
+  return /時間[:：]/.test(text) && /上車[:：]/.test(text) && /下車[:：]/.test(text);
+}
+
+function parseRideForm(text) {
+  if (!isRideForm(text)) return null;
+
+  const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  const data = {};
+  for (const line of lines) {
+    const m = line.match(/^([^:：]+)\s*[:：]\s*(.*)$/);
+    if (!m) continue;
+    const key = m[1].trim();
+    const value = m[2].trim();
+    if (!value) continue;
+    data[key] = value;
+  }
+
+  const pickup = data["上車"];
+  const dropoff = data["下車"];
+  const time = data["時間"];
+  const date = data["日期"];
+  const passengers = data["人數"];
+
+  if (!pickup || !dropoff || !time) return null;
+
+  return {
+    pickup,
+    dropoff,
+    time,
+    date,
+    passengers,
+    rawText: text
+  };
 }
 
 // ========================
