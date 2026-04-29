@@ -1,0 +1,75 @@
+🧠 我幫你整理好（最終版 PROJECT_STATE）
+
+👉 你直接存起來用👇
+
+【PROJECT_STATE（最終整合版）】
+【專案目標】
+
+建立 LINE 白牌車派單系統（搶單制）
+客人 → 叫車 → 派單 → 司機搶單 → 回報 → 完成
+
+【系統架構】
+LINE
+ ↓
+Webhook（Railway /webhook）
+ ↓
+Node.js (Express server.js)
+ ↓
+（未來）Supabase / AI
+【完整流程】
+客人說「叫車 / 你好」→ 要求輸入地址
+客人輸入地址 → 建立訂單（waiting）
+推送到司機群（只一次）
+司機喊：信義10
+系統回：司機10分(抵達) + 請貼車卡
+司機貼車卡 → matched
+客人收到：
+司機幾分鐘到
+車卡（分兩則）
+司機說：到 → arrived → 通知客人
+司機說：上 → onboard → 通知客人
+【狀態機】
+waiting → matched → arrived → onboard → done（未做）
+【客人邏輯】
+關鍵字（叫車 / 你好 / 短訊）→ 引導輸入地址
+其他內容 → 視為地址 → 建立訂單
+waiting → 回「安排中」
+matched → 回「司機前往中」
+onboard → 回「感謝搭乘」
+【司機邏輯】
+群組限定 DRIVER_GROUP_ID
+喊單（regex 抓時間）→ pendingDriver
+車卡（同一司機）→ 完成派單
+到 → arrived
+上 → onboard
+【核心規則】
+訂單只推送一次
+搶單 = 第一個完成「喊單 + 車卡」
+車卡必須分兩則給客人
+replyToken 只用一次，其餘用 push
+webhook 必須回 200
+狀態不可跳
+【關鍵變數（目前）】
+currentOrder
+pendingDriver
+handledEvents
+【系統限制】
+單一訂單
+無 orderId
+無多訂單
+無資料庫（目前）
+無 AI 判斷
+【下一步開發】
+多訂單（orders[]）
+orderId
+綁訂單派單
+AI 決策
+Supabase 持久化
+雙 Bot 架構
+【風險點】
+webhook 未回 200 → LINE 重送
+replyToken 重複 → 失敗
+pendingDriver 卡住
+regex 誤判時間
+關鍵字（到 / 上）過寬
+單一訂單無法擴展

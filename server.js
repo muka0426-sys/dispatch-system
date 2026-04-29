@@ -8,13 +8,13 @@ app.use(express.json());
 const PORT = process.env.PORT || 3000;
 
 // ===== 狀態 =====
-let currentOrder = null;
 /*
 status:
-idle → waiting → matched → arrived → onboard → done
+waiting → matched → arrived → onboard → done
 */
-
-let pendingDriver = null;
+let orders = [];
+let nextOrderSeq = 1;
+let pendingDriver = {};
 
 // 防重複
 const handledEvents = new Set();
@@ -57,53 +57,51 @@ async function handleEvent(event) {
     if (sourceType === "group") {
 
       if (event.source.groupId !== DRIVER_GROUP_ID) return;
-      if (!currentOrder) return;
+      if (orders.length === 0) return;
 
       // ===== 喊單 =====
       const bidMatch = text.match(/(.+?)(\d+)/);
-
-      if (currentOrder.status === "waiting" && bidMatch && !pendingDriver) {
-
+      const waitingOrder = getNextWaitingOrder();
+      if (waitingOrder && bidMatch && !pendingDriver[waitingOrder.orderId]) {
         const time = bidMatch[2];
-
-        pendingDriver = {
-          userId,
-          time
-        };
-
+        pendingDriver[waitingOrder.orderId] = { userId, time };
         await reply(replyToken, `司機${time}分(抵達)\n請貼車卡`);
         return;
       }
 
       // ===== 車卡 =====
-      if (currentOrder.status === "waiting" && pendingDriver && pendingDriver.userId === userId) {
-
-        currentOrder.status = "matched";
+      const cardTargetOrder = getWaitingOrderByPendingDriver(userId);
+      if (cardTargetOrder) {
+        const pending = pendingDriver[cardTargetOrder.orderId];
+        cardTargetOrder.status = "matched";
+        cardTargetOrder.driverId = userId;
+        cardTargetOrder.driverEta = pending.time;
 
         await reply(replyToken, "已派你出發 🚗");
 
         await pushText(
-          currentOrder.customerId,
+          cardTargetOrder.customerId,
 `🚗 已為您安排司機
 
-司機${pendingDriver.time}分抵達`
+司機${pending.time}分抵達`
         );
 
         // 👉 再補車卡（第二則）
-        await pushText(currentOrder.customerId, text);
+        await pushText(cardTargetOrder.customerId, text);
+        delete pendingDriver[cardTargetOrder.orderId];
 
         return;
       }
 
       // ===== 到點 =====
-      if (currentOrder.status === "matched" && text.includes("到")) {
-
-        currentOrder.status = "arrived";
+      const matchedOrder = getDriverOrderByStatus(userId, "matched");
+      if (matchedOrder && text.includes("到")) {
+        matchedOrder.status = "arrived";
 
         await reply(replyToken, "已通知客人");
 
         await pushText(
-          currentOrder.customerId,
+          matchedOrder.customerId,
 `📍 司機已抵達，請準備上車`
         );
 
@@ -111,12 +109,12 @@ async function handleEvent(event) {
       }
 
       // ===== 上車 =====
-      if (currentOrder.status === "arrived" && text.includes("上")) {
-
-        currentOrder.status = "onboard";
+      const arrivedOrder = getDriverOrderByStatus(userId, "arrived");
+      if (arrivedOrder && text.includes("上")) {
+        arrivedOrder.status = "onboard";
 
         await pushText(
-          currentOrder.customerId,
+          arrivedOrder.customerId,
 `✅ 司機已回報您已上車
 感謝您的搭乘 🙏`
         );
@@ -131,38 +129,34 @@ async function handleEvent(event) {
     // 🧑 客人（真人邏輯）
     // =========================
     if (sourceType === "user") {
-
-      // 👉 沒訂單
-      if (!currentOrder || currentOrder.status === "done") {
-
-        // 問候 / 無效
-        if (text.length <= 3 || text.includes("你好") || text.includes("叫車")) {
-          await reply(replyToken,
-`您好 👋
-請問哪裡需要車呢？
-
-請直接輸入上車地點
-例如：
-信義區松山路123號`);
+      const activeOrder = getActiveOrder(userId);
+      if (!activeOrder) {
+        if (text.includes("叫車") || text.includes("你好") || text.length <= 3) {
+          await reply(replyToken, "請輸入上車地址");
           return;
         }
 
         // 👉 建單（只要有地址）
-        currentOrder = {
+        const orderId = createOrderId();
+        const newOrder = {
+          orderId,
           status: "waiting",
           customerId: userId,
-          address: text
+          address: text,
+          createdAt: Date.now(),
+          driverId: null,
+          driverEta: null
         };
+        orders.push(newOrder);
 
-        pendingDriver = null;
-
-        await reply(replyToken, "好的，幫您安排司機中 🚕");
+        await reply(replyToken, "幫你安排司機中");
 
         // 👉 丟司機群（只會一次）
         await pushText(
           DRIVER_GROUP_ID,
 `🔥 RS 訂單
 
+🆔 ${orderId}
 📍 ${text}
 
 👉 請喊：信義10`
@@ -171,28 +165,45 @@ async function handleEvent(event) {
         return;
       }
 
-      // 👉 已在叫車
-      if (currentOrder.status === "waiting") {
-        await reply(replyToken, "已在幫您安排司機，請稍等 🚕");
-        return;
-      }
-
-      // 👉 已派車
-      if (currentOrder.status === "matched") {
-        await reply(replyToken, "司機正在前往中 🚗");
-        return;
-      }
-
-      // 👉 已完成
-      if (currentOrder.status === "onboard") {
-        await reply(replyToken, "祝您旅途愉快 🙏");
-        return;
-      }
+      await reply(replyToken, "已在安排中");
+      return;
     }
 
   } catch (err) {
     console.error("❌ error:", err);
   }
+}
+
+function createOrderId() {
+  const id = `RS${String(nextOrderSeq).padStart(4, "0")}`;
+  nextOrderSeq += 1;
+  return id;
+}
+
+function getActiveOrder(customerId) {
+  const activeStatuses = new Set(["waiting", "matched", "arrived"]);
+  for (let i = orders.length - 1; i >= 0; i -= 1) {
+    const order = orders[i];
+    if (order.customerId === customerId && activeStatuses.has(order.status)) {
+      return order;
+    }
+  }
+  return null;
+}
+
+function getNextWaitingOrder() {
+  return orders.find((order) => order.status === "waiting");
+}
+
+function getWaitingOrderByPendingDriver(driverUserId) {
+  return orders.find((order) => {
+    const pending = pendingDriver[order.orderId];
+    return order.status === "waiting" && pending && pending.userId === driverUserId;
+  });
+}
+
+function getDriverOrderByStatus(driverUserId, status) {
+  return orders.find((order) => order.driverId === driverUserId && order.status === status);
 }
 
 // ========================
