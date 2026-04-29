@@ -15,7 +15,10 @@ waiting → matched → arrived → onboard → done
 let orders = [];
 let nextOrderSeq = 1;
 let pendingDriver = {};
-let pendingRideForm = new Set();
+
+// user state
+// idle | waiting_form | collecting_data | waiting_dispatch | completed
+const userStates = new Map();
 
 // 防重複
 const handledEvents = new Set();
@@ -114,6 +117,9 @@ async function handleEvent(event) {
       if (arrivedOrder && text.includes("上")) {
         arrivedOrder.status = "onboard";
 
+        setUserState(arrivedOrder.customerId, "completed");
+        clearUserState(arrivedOrder.customerId);
+
         await pushText(
           arrivedOrder.customerId,
 `✅ 司機已回報您已上車
@@ -130,15 +136,25 @@ async function handleEvent(event) {
     // 🧑 客人（真人邏輯）
     // =========================
     if (sourceType === "user") {
-      const activeOrder = getActiveOrder(userId);
-      if (activeOrder) {
-        await reply(replyToken, "已在安排中");
+      const state = getUserState(userId);
+      const isGreeting = text.includes("你好") || text.includes("哈囉") || text.toLowerCase().includes("hello");
+      const isCallRide = text.includes("叫車");
+
+      // 如果 user 正在流程中，不允許用無關內容重啟
+      if (state !== "idle" && isGreeting) {
+        await reply(replyToken, "請先完成目前訂單");
         return;
       }
 
-      // 只有「叫車」或「表單」才進叫車流程（避免 你好 / 哈囉 誤觸發）
-      if (text.includes("叫車")) {
-        pendingRideForm.add(userId);
+      // 叫車
+      if (isCallRide) {
+        const activeOrder = getActiveOrder(userId);
+        if (activeOrder || state === "waiting_form" || state === "collecting_data" || state === "waiting_dispatch") {
+          await reply(replyToken, "請先完成目前訂單");
+          return;
+        }
+
+        setUserState(userId, "waiting_form");
         await reply(
           replyToken,
 `❤️‍🔥雙北叫車格式❤️‍🔥
@@ -152,11 +168,16 @@ ___________________
         return;
       }
 
-      const form = parseRideForm(text);
-      if (form && (pendingRideForm.has(userId) || isRideForm(text))) {
-        pendingRideForm.delete(userId);
+      // waiting_form：只接受表單內容
+      if (state === "waiting_form") {
+        const form = parseRideForm(text);
+        if (!form) {
+          await reply(replyToken, "請依格式填寫表單");
+          return;
+        }
 
         const order = createOrder(userId, form);
+        setUserState(userId, "waiting_dispatch", { orderId: order.orderId });
 
         await reply(replyToken, "幫你安排司機中");
 
@@ -171,6 +192,12 @@ ___________________
 ♐上車:未指定走最短♐`
         );
 
+        return;
+      }
+
+      // 其他狀態：不重啟流程
+      if (state !== "idle") {
+        await reply(replyToken, "請先完成目前訂單");
         return;
       }
 
@@ -269,6 +296,18 @@ function parseRideForm(text) {
     passengers,
     rawText: text
   };
+}
+
+function getUserState(userId) {
+  return userStates.get(userId)?.state || "idle";
+}
+
+function setUserState(userId, state, data = {}) {
+  userStates.set(userId, { state, ...data, updatedAt: Date.now() });
+}
+
+function clearUserState(userId) {
+  userStates.delete(userId);
 }
 
 // ========================
