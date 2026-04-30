@@ -1,7 +1,7 @@
 import "dotenv/config";
 import express from "express";
 import { createClient } from "@supabase/supabase-js";
-import line from "@line/bot-sdk";
+import * as line from "@line/bot-sdk";
 import { parseOrderFromText } from "./utils/ai.js";
 
 const app = express();
