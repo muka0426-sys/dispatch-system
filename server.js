@@ -180,6 +180,9 @@ async function handleEvent(event) {
       const ai = await parseOrderFromText(text);
       console.log("[AI] after parseOrderFromText", { userId, ai });
 
+      const isLikelyRideIntent =
+        /(叫車|搭車|叫我|去|到|從|上車|下車|起點|終點)/.test(text);
+
       const isValidOrder =
         ai &&
         typeof ai === "object" &&
@@ -190,17 +193,16 @@ async function handleEvent(event) {
         !ai.from.includes("未知") &&
         !ai.to.includes("未知") &&
         !ai.from.includes("測試") &&
-        !ai.to.includes("測試");
+        !ai.to.includes("測試") &&
+        isLikelyRideIntent;
 
       // AI 判斷不是叫車訊息：保持沈默
       if (!isValidOrder) return;
 
       const ok = await createOrderFromAi(userId, text, ai);
-      if (ok) {
-        await replyText(replyToken, "✅ 訂單已受理，正在媒合司機");
-      } else {
-        await replyText(replyToken, "❌ 訂單建立失敗，請稍後再試");
-      }
+      if (!ok) return;
+
+      await replyText(replyToken, "✅ 訂單已受理，正在媒合司機");
 
       return;
     }
