@@ -2,6 +2,7 @@ import "dotenv/config";
 import express from "express";
 import { createClient } from "@supabase/supabase-js";
 import line from "@line/bot-sdk";
+import { parseOrderFromText } from "./utils/ai.js";
 
 const app = express();
 
@@ -172,62 +173,33 @@ async function handleEvent(event) {
     }
 
     // =========================
-    // 🧑 客人（真人邏輯，完整搬回）
+    // 🧑 客人：AI 介入（先判斷意圖）
     // =========================
     if (sourceType === "user") {
-      const state = getUserState(userId);
+      console.log("[AI] before parseOrderFromText", { userId, text });
+      const ai = await parseOrderFromText(text);
+      console.log("[AI] after parseOrderFromText", { userId, ai });
 
-      // 取消：回 idle + 刪除訂單
-      if (text.includes("取消")) {
-        await deleteOrderByCustomer(userId);
-        setUserState(userId, "idle");
-        await replyText(replyToken, "已取消訂單");
-        return;
-      }
+      const isValidOrder =
+        ai &&
+        typeof ai === "object" &&
+        typeof ai.from === "string" &&
+        typeof ai.to === "string" &&
+        ai.from.trim() &&
+        ai.to.trim() &&
+        !ai.from.includes("未知") &&
+        !ai.to.includes("未知") &&
+        !ai.from.includes("測試") &&
+        !ai.to.includes("測試");
 
-      // 只有「叫車」才進流程
-      if (text.includes("叫車")) {
-        const active = await getActiveOrder(userId);
-        if (active || state === "filling_form" || state === "waiting_dispatch") return;
+      // AI 判斷不是叫車訊息：保持沈默
+      if (!isValidOrder) return;
 
-        setUserState(userId, "filling_form");
-        await replyText(
-          replyToken,
-`❤️‍🔥雙北叫車格式❤️‍🔥
-___________________
-日期：
-時間：
-上車：
-下車：
-人數：`
-        );
-        return;
-      }
-
-      // filling_form：表單需含 上車/下車 才視為完成
-      if (state === "filling_form") {
-        if (!text.includes("上車") || !text.includes("下車")) return;
-
-        const form = parseRideForm(text);
-        if (!form) return;
-
-        const order = await createOrder(userId, form);
-        setUserState(userId, "waiting_dispatch", { orderId: order.orderId });
-
-        await replyText(replyToken, "幫你安排司機中");
-
-        await pushText(
-          DRIVER_GROUP_ID,
-`（${order.pickup}）
-
-❤️‍🔥______R•S______❤️‍🔥
-💛5/2直2內100💛
-300回10%🧨600回15%
-🔥900回20%🔥
-♐上車:未指定走最短♐`
-        );
-
-        return;
+      const ok = await createOrderFromAi(userId, text, ai);
+      if (ok) {
+        await replyText(replyToken, "✅ 訂單已受理，正在媒合司機");
+      } else {
+        await replyText(replyToken, "❌ 訂單建立失敗，請稍後再試");
       }
 
       return;
@@ -235,6 +207,39 @@ ___________________
 
   } catch (err) {
     console.error("❌ error:", err);
+  }
+}
+
+async function createOrderFromAi(customerId, rawText, ai) {
+  try {
+    if (!supabase) {
+      console.error("❌ Supabase client not ready (missing env).");
+      return false;
+    }
+
+    const orderId = `O${Date.now()}`;
+    const payload = {
+      order_id: orderId,
+      status: "waiting",
+      customer_id: customerId,
+      pickup: String(ai?.from ?? "").trim(),
+      dropoff: String(ai?.to ?? "").trim(),
+      date: null,
+      time: null,
+      passengers: String(ai?.passengers ?? ""),
+      form_text: String(rawText ?? "")
+    };
+
+    const { error } = await supabase.from("orders").insert(payload);
+    if (error) {
+      console.error("❌ createOrderFromAi insert error:", error);
+      return false;
+    }
+
+    return true;
+  } catch (err) {
+    console.error("❌ createOrderFromAi error:", err);
+    return false;
   }
 }
 
