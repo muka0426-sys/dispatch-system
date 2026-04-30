@@ -27,16 +27,27 @@ export async function parseOrderFromText(messageText) {
     const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
 
     const prompt = `
-你是一個「白牌車派單系統」的文字解析器。
-請將使用者輸入解析成 JSON，且只輸出 JSON（不要任何多餘文字）。
+你是一個「白牌車派單系統」的意圖辨識 + 訂單資訊抽取器。
+你只允許輸出 JSON（不要任何多餘文字、不要 markdown）。
 
-輸出格式：
+任務：判斷使用者訊息是否具有「叫車/搭車」意圖。
+- 如果不是叫車意圖（例如：打招呼、閒聊、詢問天氣、貼圖），請回傳：{"isOrder": false}
+- 如果是叫車意圖，請回傳：{"isOrder": true, ...} 並盡可能抽取欄位。
+
+輸出 JSON 格式（鍵名固定，未取得則用 null 或空字串）：
 {
-  "from": "起點(必填)",
-  "to": "終點(必填)",
+  "isOrder": true|false,
+  "date": "日期(可選，字串)",
+  "time": "時間(可選，字串)",
+  "from": "起點(必填，字串)",
+  "to": "終點(必填，字串)",
   "passengers": 1,
-  "note": "可選備註"
+  "note": "備註(可選，字串)"
 }
+
+判斷規則提示：
+- 具有叫車意圖的常見特徵：提到「叫車/搭車/去/到/從/上車/下車/起點/終點」或提供起終點資訊。
+- 只有當你能合理判斷是叫車意圖時才回 isOrder=true；否則一律 isOrder=false。
 
 使用者輸入：
 ${JSON.stringify(String(messageText ?? ""))}
@@ -48,20 +59,24 @@ ${JSON.stringify(String(messageText ?? ""))}
     const obj = extractJsonObject(text);
     if (!obj) throw new Error("AI output not JSON");
 
-    return {
-      from: String(obj.from ?? "").trim() || "未知起點",
-      to: String(obj.to ?? "").trim() || "未知終點",
-      passengers: Number(obj.passengers) || 1,
-      note: String(obj.note ?? "")
-    };
+    const isOrder = Boolean(obj.isOrder);
+    if (!isOrder) return null;
+
+    const from = String(obj.from ?? "").trim();
+    const to = String(obj.to ?? "").trim();
+    const date = obj.date == null ? null : String(obj.date).trim() || null;
+    const time = obj.time == null ? null : String(obj.time).trim() || null;
+    const passengersNum = Number(obj.passengers);
+    const passengers = Number.isFinite(passengersNum) && passengersNum > 0 ? passengersNum : 1;
+    const note = String(obj.note ?? "");
+
+    // from/to 缺失就視為非有效訂單（保持沈默）
+    if (!from || !to) return null;
+
+    return { isOrder: true, from, to, date, time, passengers, note };
 
   } catch (err) {
-    // 🔥 完全靜音（關鍵）
-    return {
-      from: "測試起點",
-      to: "測試終點",
-      passengers: 1,
-      note: ""
-    };
+    console.error("AI 解析錯誤:", err);
+    return null;
   }
 }
