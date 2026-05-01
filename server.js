@@ -45,6 +45,8 @@ const lineConfig = {
   channelSecret: (LINE_CHANNEL_SECRET || "").trim()
 };
 
+console.log("LINE Config 初始化完成 (已過濾空格)");
+
 const lineClient =
   LINE_CHANNEL_ACCESS_TOKEN && LINE_CHANNEL_SECRET ? new line.Client(lineConfig) : null;
 
@@ -85,6 +87,9 @@ app.post("/webhook", line.middleware(lineConfig), async (req, res) => {
     }
   }
 });
+
+// Keep JSON parser after webhook to avoid signature issues
+app.use(express.json());
 
 // ========================
 async function handleEvent(event) {
