@@ -191,10 +191,19 @@ async function handleEvent(event) {
     // =========================
     if (sourceType === "user") {
       console.log("[AI] before parseOrderFromText", { userId, text });
-      const ai = await parseOrderFromText(text);
-      console.log("[AI] after parseOrderFromText", { userId, ai });
+      const aiRaw = await parseOrderFromText(text);
+      console.log("[AI] after parseOrderFromText", { userId, ai: aiRaw });
 
-      if (ai == null) {
+      if (aiRaw == null) {
+        console.log("AI 判斷這不是訂單");
+        return;
+      }
+
+      let ai;
+      try {
+        ai = typeof aiRaw === "string" ? JSON.parse(aiRaw) : aiRaw;
+      } catch (err) {
+        console.error("❌ AI JSON parse failed:", err, { aiRaw });
         console.log("AI 判斷這不是訂單");
         return;
       }

@@ -72,7 +72,8 @@ ${JSON.stringify(String(messageText ?? ""))}
 
     if (!from || !to) return null;
 
-    return { isOrder: true, from, to, date, time, passengers, note };
+    // 回傳 JSON 字串（供上游直接 JSON.parse）
+    return JSON.stringify({ isOrder: true, from, to, date, time, passengers, note });
   } catch (err) {
     console.error("AI 解析錯誤:", err);
     return null;
