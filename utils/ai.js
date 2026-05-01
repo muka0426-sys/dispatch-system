@@ -27,8 +27,7 @@ export async function parseOrderFromText(messageText) {
     }
 
     const genAI = new GoogleGenerativeAI(apiKey);
-    // 👇 就是這裡！我已經幫你改成正確的 gemini-1.5-flash 了
-    const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+    const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
 
     const prompt = `
 你是一個「白牌車派單系統」的意圖辨識 + 訂單資訊抽取器。

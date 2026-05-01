@@ -1,6 +1,6 @@
 import { GoogleGenerativeAI } from "@google/generative-ai";
 
-const GEMINI_MODEL_ID = "gemini-1.5-flash";
+const GEMINI_MODEL_ID = "gemini-1.5-flash-latest";
 console.log("AI module loaded. Gemini model =", GEMINI_MODEL_ID);
 
 function extractJsonObject(text) {
@@ -81,6 +81,21 @@ ${JSON.stringify(String(messageText ?? ""))}
     // 回傳 JSON 字串（供上游直接 JSON.parse）
     return JSON.stringify({ isOrder: true, from, to, date, time, passengers, note });
   } catch (err) {
+    // 針對最常見的部署問題做更清楚的錯誤訊息
+    const status = err?.status;
+    const reason =
+      err?.errorDetails?.find?.((d) => d?.reason)?.reason ??
+      err?.errorDetails?.[0]?.reason ??
+      null;
+
+    if (status === 400 && reason === "API_KEY_INVALID") {
+      console.error(
+        "AI 解析錯誤: Gemini API Key 無效（API_KEY_INVALID）。請到 Google AI Studio 重新產生 API Key，並更新 Railway 的 GEMINI_API_KEY（確認沒有多餘空白/換行、也沒有貼錯專案或已被撤銷）。"
+      );
+      console.error("AI 錯誤摘要:", { status, reason, model: GEMINI_MODEL_ID });
+      return null;
+    }
+
     console.error("AI 解析錯誤:", err);
     return null;
   }
