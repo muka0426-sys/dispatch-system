@@ -1,6 +1,7 @@
 import "dotenv/config";
 import express from "express";
 import { pushText } from "./utils/line.js";
+import { parseOrderFromText } from "./utils/ai.js";
 
 const app = express();
 app.use(express.json());
@@ -134,6 +135,45 @@ async function handleEvent(event) {
     // =========================
     if (sourceType === "user") {
       const state = getUserState(userId);
+
+      // AI：嘗試從任意文字解析訂單（不影響原本叫車/表單流程）
+      // 若解析到有效起訖點，直接建立 waiting 訂單並派單
+      const aiOrder = await parseOrderFromText(text);
+      if (
+        aiOrder &&
+        typeof aiOrder.from === "string" &&
+        typeof aiOrder.to === "string" &&
+        aiOrder.from.trim() &&
+        aiOrder.to.trim() &&
+        !getActiveOrder(userId) &&
+        state !== "filling_form" &&
+        state !== "waiting_dispatch"
+      ) {
+        const form = {
+          pickup: aiOrder.from.trim(),
+          dropoff: aiOrder.to.trim(),
+          time: "",
+          date: null,
+          passengers: aiOrder.passengers ? String(aiOrder.passengers) : null,
+          rawText: text
+        };
+
+        const order = createOrder(userId, form);
+        setUserState(userId, "waiting_dispatch", { orderId: order.orderId });
+
+        await reply(replyToken, "幫你安排司機中");
+        await pushText(
+          DRIVER_GROUP_ID,
+`（${order.pickup}）
+
+❤️‍🔥______R•S______❤️‍🔥
+💛5/2直2內100💛
+300回10%🧨600回15%
+🔥900回20%🔥
+♐上車:未指定走最短♐`
+        );
+        return;
+      }
 
       // 取消：回 idle + 刪除訂單
       if (text.includes("取消")) {
