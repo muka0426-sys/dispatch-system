@@ -91,6 +91,8 @@ async function handleEvent(event) {
 
     if (event.type !== "message" || event.message.type !== "text") return;
 
+    console.log("收到 LINE 訊息:", event.message.text);
+
     const replyToken = event.replyToken;
     const userId = event.source?.userId;
     const text = event.message.text.trim();
@@ -179,6 +181,11 @@ async function handleEvent(event) {
       console.log("[AI] before parseOrderFromText", { userId, text });
       const ai = await parseOrderFromText(text);
       console.log("[AI] after parseOrderFromText", { userId, ai });
+
+      if (ai == null) {
+        console.log("AI 判斷這不是訂單");
+        return;
+      }
 
       const isLikelyRideIntent =
         /(叫車|搭車|叫我|去|到|從|上車|下車|起點|終點)/.test(text);
