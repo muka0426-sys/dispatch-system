@@ -28,6 +28,7 @@ export async function parseOrderFromText(messageText) {
 
     const genAI = new GoogleGenerativeAI(apiKey);
     const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+    console.log("AI model:", "gemini-1.5-flash");
 
     const prompt = `
 你是一個「白牌車派單系統」的意圖辨識 + 訂單資訊抽取器。
