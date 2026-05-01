@@ -41,8 +41,8 @@ const supabase =
     : null;
 
 const lineConfig = {
-  channelAccessToken: LINE_CHANNEL_ACCESS_TOKEN || "",
-  channelSecret: LINE_CHANNEL_SECRET || ""
+  channelAccessToken: (LINE_CHANNEL_ACCESS_TOKEN || "").trim(),
+  channelSecret: (LINE_CHANNEL_SECRET || "").trim()
 };
 
 const lineClient =
