@@ -4,6 +4,13 @@ import { createClient } from "@supabase/supabase-js";
 import * as line from "@line/bot-sdk";
 import { parseOrderFromText } from "./ai.js";
 
+console.log("--- 環境變數檢查 ---");
+console.log("LINE Token 存在:", !!process.env.LINE_CHANNEL_ACCESS_TOKEN);
+console.log("LINE Secret 存在:", !!process.env.LINE_CHANNEL_SECRET);
+console.log("Gemini Key 存在:", !!process.env.GEMINI_API_KEY);
+console.log("Supabase URL 存在:", !!process.env.SUPABASE_URL);
+console.log("--- 檢查結束 ---");
+
 const app = express();
 
 const PORT = process.env.PORT || 3000;
