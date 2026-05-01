@@ -41,8 +41,8 @@ const supabase =
     : null;
 
 const lineConfig = {
-  channelAccessToken: (LINE_CHANNEL_ACCESS_TOKEN || "").trim(),
-  channelSecret: (LINE_CHANNEL_SECRET || "").trim()
+  channelAccessToken: (process.env.LINE_CHANNEL_ACCESS_TOKEN || "").trim(),
+  channelSecret: (process.env.LINE_CHANNEL_SECRET || "").trim()
 };
 
 console.log("LINE Config 初始化完成 (已過濾空格)");
