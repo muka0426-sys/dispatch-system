@@ -1,5 +1,8 @@
 import { GoogleGenerativeAI } from "@google/generative-ai";
 
+const GEMINI_MODEL_ID = "gemini-1.5-flash";
+console.log("AI module loaded. Gemini model =", GEMINI_MODEL_ID);
+
 function extractJsonObject(text) {
   if (!text) return null;
   const s = String(text);
@@ -27,8 +30,7 @@ export async function parseOrderFromText(messageText) {
     }
 
     const genAI = new GoogleGenerativeAI(apiKey);
-    const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
-    console.log("AI model:", "gemini-1.5-flash");
+    const model = genAI.getGenerativeModel({ model: GEMINI_MODEL_ID });
 
     const prompt = `
 你是一個「白牌車派單系統」的意圖辨識 + 訂單資訊抽取器。
