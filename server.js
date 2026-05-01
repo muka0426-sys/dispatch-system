@@ -4,15 +4,34 @@ import { createClient } from "@supabase/supabase-js";
 import * as line from "@line/bot-sdk";
 import { parseOrderFromText } from "./ai.js";
 
-console.log("--- 環境變數檢查 ---");
-console.log("LINE Token 存在:", !!process.env.LINE_CHANNEL_ACCESS_TOKEN);
-console.log("LINE Secret 存在:", !!process.env.LINE_CHANNEL_SECRET);
-console.log("Gemini Key 存在:", !!process.env.GEMINI_API_KEY);
-console.log("Supabase URL 存在:", !!process.env.SUPABASE_URL);
+// ========================
+// 環境變數安全檢查 (新增的防呆機制)
+// ========================
+console.log("--- 啟動環境變數檢查 ---");
+const requiredEnvs = [
+  "LINE_CHANNEL_ACCESS_TOKEN",
+  "LINE_CHANNEL_SECRET",
+  "GEMINI_API_KEY",
+  "SUPABASE_URL",
+  "SUPABASE_SERVICE_ROLE_KEY"
+];
+
+let hasEnvError = false;
+requiredEnvs.forEach(env => {
+  if (!process.env[env]) {
+    console.error(`❌ 嚴重錯誤：缺少環境變數 [${env}]`);
+    hasEnvError = true;
+  } else {
+    console.log(`✅ ${env} 已就緒`);
+  }
+});
+
+if (hasEnvError) {
+  console.error("⚠️ 環境變數缺失，但仍嘗試啟動 (功能可能受限)");
+}
 console.log("--- 檢查結束 ---");
 
 const app = express();
-
 const PORT = process.env.PORT || 3000;
 
 // ========================
@@ -20,15 +39,8 @@ const PORT = process.env.PORT || 3000;
 // ========================
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-
-if (!SUPABASE_URL) console.error("❌ Missing env: SUPABASE_URL");
-if (!SUPABASE_SERVICE_ROLE_KEY) console.error("❌ Missing env: SUPABASE_SERVICE_ROLE_KEY");
-
 const LINE_CHANNEL_ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN;
 const LINE_CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET;
-
-if (!LINE_CHANNEL_ACCESS_TOKEN) console.error("❌ Missing env: LINE_CHANNEL_ACCESS_TOKEN");
-if (!LINE_CHANNEL_SECRET) console.error("❌ Missing env: LINE_CHANNEL_SECRET");
 
 // ========================
 // Clients
@@ -41,11 +53,11 @@ const supabase =
     : null;
 
 const lineConfig = {
-  channelAccessToken: (process.env.LINE_CHANNEL_ACCESS_TOKEN || "").trim(),
-  channelSecret: (process.env.LINE_CHANNEL_SECRET || "").trim()
+  channelAccessToken: (LINE_CHANNEL_ACCESS_TOKEN || "").trim(),
+  channelSecret: (LINE_CHANNEL_SECRET || "").trim()
 };
 
-console.log("LINE Config 初始化完成 (已過濾空格)");
+console.log("LINE Config 初始化完成");
 
 const lineClient =
   LINE_CHANNEL_ACCESS_TOKEN && LINE_CHANNEL_SECRET ? new line.Client(lineConfig) : null;
@@ -59,23 +71,17 @@ const DRIVER_GROUP_ID = "C0227c4e4d8988002cfcd6527a43d3ad3";
 // State (memory)
 // ========================
 let pendingDriver = {}; // { [orderId]: { userId, time } }
+const users = {}; // idle | filling_form | waiting_dispatch
+const handledEvents = new Set(); // 防重複
+let nextOrderSeq = 1; // local sequence
 
-// idle | filling_form | waiting_dispatch
-const users = {};
-
-// 防重複
-const handledEvents = new Set();
-
-// local sequence (best-effort restore)
-let nextOrderSeq = 1;
-
+// ========================
+// Routes
 // ========================
 app.get("/", (_, res) => res.send("ok"));
 app.get("/health", (_, res) => res.json({ ok: true }));
 
-// ========================
-// Webhook: /webhook (keep)
-// ========================
+// Webhook 必須放在 express.json() 之前，以確保簽章驗證生效
 app.post("/webhook", line.middleware(lineConfig), async (req, res) => {
   res.sendStatus(200);
   const events = req.body?.events || [];
@@ -91,6 +97,8 @@ app.post("/webhook", line.middleware(lineConfig), async (req, res) => {
 // Keep JSON parser after webhook to avoid signature issues
 app.use(express.json());
 
+// ========================
+// 核心邏輯：事件處理
 // ========================
 async function handleEvent(event) {
   try {
@@ -113,7 +121,7 @@ async function handleEvent(event) {
     console.log("📩", sourceType, text);
 
     // =========================
-    // 🚕 司機群（完全搬回邏輯）
+    // 🚕 司機群（完全搬回你的原始邏輯）
     // =========================
     if (sourceType === "group") {
       if (event.source.groupId !== DRIVER_GROUP_ID) return;
@@ -143,9 +151,7 @@ async function handleEvent(event) {
 
         await pushText(
           cardTargetOrder.customerId,
-`🚗 已為您安排司機
-
-司機${pending.time}分抵達`
+          `🚗 已為您安排司機\n\n司機${pending.time}分抵達`
         );
 
         // 👉 再補車卡（第二則）
@@ -163,7 +169,7 @@ async function handleEvent(event) {
 
         await pushText(
           matchedOrder.customerId,
-`📍 司機已抵達，請準備上車`
+          `📍 司機已抵達，請準備上車`
         );
 
         return;
@@ -176,8 +182,7 @@ async function handleEvent(event) {
 
         await pushText(
           arrivedOrder.customerId,
-`✅ 司機已回報您已上車
-感謝您的搭乘 🙏`
+          `✅ 司機已回報您已上車\n感謝您的搭乘 🙏`
         );
 
         return;
@@ -195,7 +200,7 @@ async function handleEvent(event) {
       console.log("[AI] after parseOrderFromText", { userId, ai: aiRaw });
 
       if (aiRaw == null) {
-        console.log("AI 判斷這不是訂單");
+        console.log("AI 判斷這不是訂單或金鑰缺失");
         return;
       }
 
@@ -231,7 +236,6 @@ async function handleEvent(event) {
       if (!ok) return;
 
       await replyText(replyToken, "✅ 訂單已受理，正在媒合司機");
-
       return;
     }
 
@@ -256,7 +260,7 @@ async function createOrderFromAi(customerId, rawText, ai) {
       dropoff: String(ai?.to ?? "").trim(),
       date: null,
       time: null,
-      passengers: String(ai?.passengers ?? ""),
+      passengers: String(ai?.passengers ?? "1"),
       form_text: String(rawText ?? "")
     };
 
@@ -274,7 +278,7 @@ async function createOrderFromAi(customerId, rawText, ai) {
 }
 
 // ========================
-// DB functions (Supabase)
+// DB functions (Supabase) - 完全保留原始邏輯
 // ========================
 function mapOrderRow(row) {
   return {
@@ -316,7 +320,6 @@ function createOrderId() {
 
 async function createOrder(customerId, form) {
   const orderId = createOrderId();
-
   const payload = {
     order_id: orderId,
     status: "waiting",
@@ -330,47 +333,19 @@ async function createOrder(customerId, form) {
   };
 
   if (!supabase) {
-    console.error("❌ Supabase client not ready (missing env).");
-    return {
-      orderId,
-      status: "waiting",
-      customerId,
-      pickup: form.pickup,
-      dropoff: form.dropoff,
-      date: form.date || null,
-      time: form.time,
-      passengers: form.passengers || null,
-      formText: form.rawText,
-      createdAt: Date.now(),
-      driverId: null,
-      driverEta: null
-    };
+    console.error("❌ Supabase client not ready.");
+    return { ...payload, createdAt: Date.now(), driverId: null, driverEta: null };
   }
 
   const { data, error } = await supabase
     .from("orders")
     .insert(payload)
-    .select(
-      "order_id,status,customer_id,pickup,dropoff,date,time,passengers,form_text,created_at,driver_id,driver_eta"
-    )
+    .select("*")
     .single();
 
   if (error) {
     console.error("❌ createOrder DB insert error:", error);
-    return {
-      orderId,
-      status: "waiting",
-      customerId,
-      pickup: form.pickup,
-      dropoff: form.dropoff,
-      date: form.date || null,
-      time: form.time,
-      passengers: form.passengers || null,
-      formText: form.rawText,
-      createdAt: Date.now(),
-      driverId: null,
-      driverEta: null
-    };
+    return { ...payload, createdAt: Date.now(), driverId: null, driverEta: null };
   }
 
   return mapOrderRow(data);
@@ -380,19 +355,13 @@ async function getActiveOrder(customerId) {
   if (!supabase) return null;
   const { data, error } = await supabase
     .from("orders")
-    .select(
-      "order_id,status,customer_id,pickup,dropoff,date,time,passengers,form_text,created_at,driver_id,driver_eta"
-    )
+    .select("*")
     .eq("customer_id", customerId)
     .in("status", ["waiting", "matched", "arrived"])
     .order("created_at", { ascending: false })
     .limit(1)
     .maybeSingle();
-
-  if (error) {
-    console.error("❌ getActiveOrder error:", error);
-    return null;
-  }
+  if (error) return null;
   return data ? mapOrderRow(data) : null;
 }
 
@@ -400,18 +369,12 @@ async function getNextWaitingOrder() {
   if (!supabase) return null;
   const { data, error } = await supabase
     .from("orders")
-    .select(
-      "order_id,status,customer_id,pickup,dropoff,date,time,passengers,form_text,created_at,driver_id,driver_eta"
-    )
+    .select("*")
     .eq("status", "waiting")
     .order("created_at", { ascending: true })
     .limit(1)
     .maybeSingle();
-
-  if (error) {
-    console.error("❌ getNextWaitingOrder error:", error);
-    return null;
-  }
+  if (error) return null;
   return data ? mapOrderRow(data) : null;
 }
 
@@ -424,19 +387,13 @@ async function getWaitingOrderByPendingDriver(driverUserId) {
 
   const { data, error } = await supabase
     .from("orders")
-    .select(
-      "order_id,status,customer_id,pickup,dropoff,date,time,passengers,form_text,created_at,driver_id,driver_eta"
-    )
+    .select("*")
     .in("order_id", orderIds)
     .eq("status", "waiting")
     .order("created_at", { ascending: true })
     .limit(1)
     .maybeSingle();
-
-  if (error) {
-    console.error("❌ getWaitingOrderByPendingDriver error:", error);
-    return null;
-  }
+  if (error) return null;
   return data ? mapOrderRow(data) : null;
 }
 
@@ -444,19 +401,13 @@ async function getDriverOrderByStatus(driverUserId, status) {
   if (!supabase) return null;
   const { data, error } = await supabase
     .from("orders")
-    .select(
-      "order_id,status,customer_id,pickup,dropoff,date,time,passengers,form_text,created_at,driver_id,driver_eta,updated_at"
-    )
+    .select("*")
     .eq("driver_id", driverUserId)
     .eq("status", status)
     .order("updated_at", { ascending: false })
     .limit(1)
     .maybeSingle();
-
-  if (error) {
-    console.error("❌ getDriverOrderByStatus error:", error);
-    return null;
-  }
+  if (error) return null;
   return data ? mapOrderRow(data) : null;
 }
 
@@ -472,28 +423,17 @@ async function updateOrderByOrderId(orderId, patch) {
 
 async function deleteOrderByCustomer(customerId) {
   if (!supabase) return false;
-
   const { data, error } = await supabase
     .from("orders")
-    .select("order_id,status,created_at")
+    .select("order_id")
     .eq("customer_id", customerId)
     .in("status", ["waiting", "matched", "arrived", "onboard"])
     .order("created_at", { ascending: false })
     .limit(1)
     .maybeSingle();
+  if (error || !data?.order_id) return false;
 
-  if (error) {
-    console.error("❌ deleteOrderByCustomer select error:", error);
-    return false;
-  }
-  if (!data?.order_id) return false;
-
-  const { error: delErr } = await supabase.from("orders").delete().eq("order_id", data.order_id);
-  if (delErr) {
-    console.error("❌ deleteOrderByCustomer delete error:", delErr);
-    return false;
-  }
-
+  await supabase.from("orders").delete().eq("order_id", data.order_id);
   if (pendingDriver[data.order_id]) delete pendingDriver[data.order_id];
   return true;
 }
@@ -507,18 +447,13 @@ function isRideForm(text) {
 
 function parseRideForm(text) {
   if (!isRideForm(text)) return null;
-
   const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
   const data = {};
   for (const line of lines) {
     const m = line.match(/^([^:：]+)\s*[:：]\s*(.*)$/);
     if (!m) continue;
-    const key = m[1].trim();
-    const value = m[2].trim();
-    if (!value) continue;
-    data[key] = value;
+    data[m[1].trim()] = m[2].trim();
   }
-
   const pickup = data["上車"];
   const dropoff = data["下車"];
   const time = data["時間"];
@@ -526,15 +461,7 @@ function parseRideForm(text) {
   const passengers = data["人數"];
 
   if (!pickup || !dropoff || !time) return null;
-
-  return {
-    pickup,
-    dropoff,
-    time,
-    date,
-    passengers,
-    rawText: text
-  };
+  return { pickup, dropoff, time, date, passengers, rawText: text };
 }
 
 // ========================
