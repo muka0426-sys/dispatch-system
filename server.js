@@ -135,6 +135,8 @@ async function handleEvent(event) {
     // =========================
     if (sourceType === "user") {
       const state = getUserState(userId);
+      const hasCarKeyword = text.includes("叫車") || text.includes("車");
+      const activeOrder = getActiveOrder(userId);
 
       // AI：嘗試從任意文字解析訂單（不影響原本叫車/表單流程）
       // 若解析到有效起訖點，直接建立 waiting 訂單並派單
@@ -175,6 +177,40 @@ async function handleEvent(event) {
         return;
       }
 
+      // 如果提到叫車/車，但 AI 沒抓到完整資訊：不要沉默，改用引導
+      if (hasCarKeyword) {
+        // 若已在填表流程中，直接提示補齊欄位（避免卡住）
+        if (state === "filling_form") {
+          await reply(replyToken, "請依格式補齊：時間、上車、下車、人數");
+          return;
+        }
+
+        // 若已有進行中訂單，也要回覆提示（不要無聲 return）
+        if (activeOrder || state === "waiting_dispatch") {
+          await reply(replyToken, "你目前已有進行中訂單，若要重新叫車請先輸入「取消」");
+          return;
+        }
+
+        // 否則：引導叫車選單/追問目的地
+        if (text.includes("叫車")) {
+          setUserState(userId, "filling_form");
+          await reply(
+            replyToken,
+`❤️‍🔥雙北叫車格式❤️‍🔥
+___________________
+日期：
+時間：
+上車：
+下車：
+人數：`
+          );
+          return;
+        }
+
+        await reply(replyToken, "請問要去哪裡？（可直接回覆：從哪裡到哪裡/或依叫車格式）");
+        return;
+      }
+
       // 取消：回 idle + 刪除訂單
       if (text.includes("取消")) {
         deleteOrderByCustomer(userId);
@@ -185,7 +221,10 @@ async function handleEvent(event) {
 
       // 只有「叫車」才進流程
       if (text.includes("叫車")) {
-        if (getActiveOrder(userId) || state === "filling_form" || state === "waiting_dispatch") return;
+        if (activeOrder || state === "filling_form" || state === "waiting_dispatch") {
+          await reply(replyToken, "你目前已有進行中訂單，若要重新叫車請先輸入「取消」");
+          return;
+        }
 
         setUserState(userId, "filling_form");
         await reply(
