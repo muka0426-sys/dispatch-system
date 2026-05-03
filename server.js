@@ -1,7 +1,7 @@
 import "dotenv/config";
 import express from "express";
 import { pushText } from "./utils/line.js";
-import { parseOrderFromText } from "./utils/ai.js";
+import { parseOrderFromText } from "./utils/ai_v7.js";
 
 console.log("[boot] server.js", {
   npm_package_version: process.env.npm_package_version ?? "(run via npm start to populate)",
