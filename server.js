@@ -3,6 +3,13 @@ import express from "express";
 import { pushText } from "./utils/line.js";
 import { parseOrderFromText } from "./utils/ai.js";
 
+console.log("[boot] server.js", {
+  npm_package_version: process.env.npm_package_version ?? "(run via npm start to populate)",
+  railwayGitSha: process.env.RAILWAY_GIT_COMMIT_SHA ?? "(unset)",
+  railwayGitBranch: process.env.RAILWAY_GIT_BRANCH ?? "(unset)",
+  cwd: process.cwd()
+});
+
 const app = express();
 app.use(express.json());
 
