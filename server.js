@@ -160,53 +160,55 @@ async function handleEvent(event) {
         setDispatchDraft(userId, merged);
       }
 
-      const draftComplete =
-        ai?.complete === true &&
-        isDispatchDraftFilled(merged);
+      const pickupReadyForCard =
+        Boolean(ai?.pickup_verified) && Boolean(merged.pickup?.trim());
+      const driverReady =
+        Boolean(ai?.pickup_verified) &&
+        Boolean(ai?.time_clear) &&
+        Boolean(merged.pickup?.trim()) &&
+        Boolean(merged.time?.trim());
 
-      if (draftComplete) {
+      if (driverReady) {
         const finalBlock = buildAcceleratedDispatchFormat(merged);
-        await reply(replyToken, finalBlock);
+        const customerMsg = [ai.reply, finalBlock].filter(Boolean).join("\n\n");
+        await reply(replyToken, customerMsg);
 
         const form = draftToRideForm(merged, finalBlock);
         const order = createOrder(userId, form);
         clearDispatchDraft(userId);
         setUserState(userId, "waiting_dispatch", { orderId: order.orderId });
 
-        await pushText(
-          DRIVER_GROUP_ID,
-`（${order.pickup}）
+        await pushText(DRIVER_GROUP_ID, finalBlock);
+        return;
+      }
 
-❤️‍🔥______R•S______❤️‍🔥
-💛5/2直2內100💛
-300回10%🧨600回15%
-🔥900回20%🔥
-♐上車:未指定走最短♐`
-        );
+      if (pickupReadyForCard) {
+        const finalBlock = buildAcceleratedDispatchFormat(merged);
+        const customerMsg = [ai.reply, finalBlock].filter(Boolean).join("\n\n");
+        await reply(replyToken, customerMsg);
+        if (text.includes("叫車") && getUserState(userId) === "idle") {
+          setUserState(userId, "filling_form");
+        }
         return;
       }
 
       if (state === "filling_form") {
         const legacyForm = parseRideForm(text);
         if (legacyForm) {
+          const legacyDraft = legacyFormToDispatchDraft(legacyForm);
+          if (!legacyDraft.pickup?.trim() || !legacyDraft.time?.trim()) {
+            await reply(replyToken, "請至少提供「上車地點」與「時間」，下車可稍後再補或寫未提供。");
+            return;
+          }
+          const finalBlock = buildAcceleratedDispatchFormat(legacyDraft);
           clearDispatchDraft(userId);
-          const order = createOrder(userId, legacyForm);
+          const order = createOrder(userId, draftToRideForm(legacyDraft, finalBlock));
           setUserState(userId, "waiting_dispatch", { orderId: order.orderId });
-          await reply(replyToken, "幫你安排司機中");
-          await pushText(
-            DRIVER_GROUP_ID,
-`（${order.pickup}）
-
-❤️‍🔥______R•S______❤️‍🔥
-💛5/2直2內100💛
-300回10%🧨600回15%
-🔥900回20%🔥
-♐上車:未指定走最短♐`
+          await reply(
+            replyToken,
+            `已為您確認並送出派單，以下為本次行程資訊：\n\n${finalBlock}`
           );
-          return;
-        }
-        if (hasCarKeyword && !text.includes("上車") && !text.includes("下車")) {
-          await reply(replyToken, "請依格式補齊：日期、時間、上車（含門牌）、下車、人數");
+          await pushText(DRIVER_GROUP_ID, finalBlock);
           return;
         }
       }
@@ -300,7 +302,7 @@ function getDriverOrderByStatus(driverUserId, status) {
 }
 
 function isRideForm(text) {
-  return /時間[:：]/.test(text) && /上車[:：]/.test(text) && /下車[:：]/.test(text);
+  return /上車[:：]/.test(text) && /時間[:：]/.test(text);
 }
 
 function parseRideForm(text) {
@@ -323,14 +325,14 @@ function parseRideForm(text) {
   const date = data["日期"];
   const passengers = data["人數"];
 
-  if (!pickup || !dropoff || !time) return null;
+  if (!pickup || !time) return null;
 
   return {
     pickup,
-    dropoff,
+    dropoff: dropoff || "",
     time,
-    date,
-    passengers,
+    date: date || "",
+    passengers: passengers || "",
     rawText: text
   };
 }
@@ -382,28 +384,44 @@ function mergeDispatchDraft(base, patch) {
   return out;
 }
 
-function isDispatchDraftFilled(d) {
-  return ["date", "time", "pickup", "dropoff", "passengers"].every((k) => Boolean(d[k]?.trim()));
+function displayDispatchField(v) {
+  const s = String(v ?? "").trim();
+  return s || "未提供";
 }
 
 function buildAcceleratedDispatchFormat(d) {
   return `❤️‍🔥加速派車格式❤️‍🔥
 
-日期：${d.date}
-時間：${d.time}
-上車：${d.pickup}
-下車：${d.dropoff}
-人數：${d.passengers}`;
+日期：${displayDispatchField(d.date)}
+時間：${displayDispatchField(d.time)}
+上車：${displayDispatchField(d.pickup)}
+下車：${displayDispatchField(d.dropoff)}
+人數：${displayDispatchField(d.passengers)}`;
 }
 
 function draftToRideForm(d, rawText) {
+  const pickup = String(d.pickup ?? "").trim();
+  const time = String(d.time ?? "").trim();
+  const dropoff = String(d.dropoff ?? "").trim();
+  const date = String(d.date ?? "").trim();
+  const passengers = String(d.passengers ?? "").trim();
   return {
-    pickup: d.pickup,
-    dropoff: d.dropoff,
-    time: d.time,
-    date: d.date || null,
-    passengers: d.passengers || null,
+    pickup,
+    dropoff: dropoff || "未提供",
+    time,
+    date: date || null,
+    passengers: passengers || null,
     rawText
+  };
+}
+
+function legacyFormToDispatchDraft(form) {
+  return {
+    date: String(form.date ?? "").trim(),
+    time: String(form.time ?? "").trim(),
+    pickup: String(form.pickup ?? "").trim(),
+    dropoff: String(form.dropoff ?? "").trim(),
+    passengers: String(form.passengers ?? "").trim()
   };
 }
 
