@@ -138,32 +138,41 @@ async function handleEvent(event) {
       const hasCarKeyword = text.includes("叫車") || text.includes("車");
       const activeOrder = getActiveOrder(userId);
 
-      // AI：嘗試從任意文字解析訂單（不影響原本叫車/表單流程）
-      // 若解析到有效起訖點，直接建立 waiting 訂單並派單
-      const aiOrder = await parseOrderFromText(text);
-      if (
-        aiOrder &&
-        typeof aiOrder.from === "string" &&
-        typeof aiOrder.to === "string" &&
-        aiOrder.from.trim() &&
-        aiOrder.to.trim() &&
-        !getActiveOrder(userId) &&
-        state !== "filling_form" &&
-        state !== "waiting_dispatch"
-      ) {
-        const form = {
-          pickup: aiOrder.from.trim(),
-          dropoff: aiOrder.to.trim(),
-          time: "",
-          date: null,
-          passengers: aiOrder.passengers ? String(aiOrder.passengers) : null,
-          rawText: text
-        };
+      if (text.includes("取消")) {
+        deleteOrderByCustomer(userId);
+        clearDispatchDraft(userId);
+        setUserState(userId, "idle");
+        await reply(replyToken, "已取消訂單");
+        return;
+      }
 
+      if (activeOrder || state === "waiting_dispatch") {
+        await reply(replyToken, "你目前已有進行中訂單，若要重新叫車請先輸入「取消」");
+        return;
+      }
+
+      const prevDraft = getDispatchDraft(userId);
+      const ai = await parseOrderFromText(text, { draft: prevDraft });
+
+      let merged = prevDraft;
+      if (ai) {
+        merged = mergeDispatchDraft(prevDraft, ai.draft);
+        setDispatchDraft(userId, merged);
+      }
+
+      const draftComplete =
+        ai?.complete === true &&
+        isDispatchDraftFilled(merged);
+
+      if (draftComplete) {
+        const finalBlock = buildAcceleratedDispatchFormat(merged);
+        await reply(replyToken, finalBlock);
+
+        const form = draftToRideForm(merged, finalBlock);
         const order = createOrder(userId, form);
+        clearDispatchDraft(userId);
         setUserState(userId, "waiting_dispatch", { orderId: order.orderId });
 
-        await reply(replyToken, "幫你安排司機中");
         await pushText(
           DRIVER_GROUP_ID,
 `（${order.pickup}）
@@ -177,27 +186,46 @@ async function handleEvent(event) {
         return;
       }
 
-      // 如果提到叫車/車，但 AI 沒抓到完整資訊：不要沉默，改用引導
+      if (state === "filling_form") {
+        const legacyForm = parseRideForm(text);
+        if (legacyForm) {
+          clearDispatchDraft(userId);
+          const order = createOrder(userId, legacyForm);
+          setUserState(userId, "waiting_dispatch", { orderId: order.orderId });
+          await reply(replyToken, "幫你安排司機中");
+          await pushText(
+            DRIVER_GROUP_ID,
+`（${order.pickup}）
+
+❤️‍🔥______R•S______❤️‍🔥
+💛5/2直2內100💛
+300回10%🧨600回15%
+🔥900回20%🔥
+♐上車:未指定走最短♐`
+          );
+          return;
+        }
+        if (hasCarKeyword && !text.includes("上車") && !text.includes("下車")) {
+          await reply(replyToken, "請依格式補齊：日期、時間、上車（含門牌）、下車、人數");
+          return;
+        }
+      }
+
+      if (ai) {
+        await reply(replyToken, ai.reply);
+        if (text.includes("叫車") && getUserState(userId) === "idle") {
+          setUserState(userId, "filling_form");
+        }
+        return;
+      }
+
       if (hasCarKeyword) {
-        // 若已在填表流程中，直接提示補齊欄位（避免卡住）
-        if (state === "filling_form") {
-          await reply(replyToken, "請依格式補齊：時間、上車、下車、人數");
-          return;
-        }
-
-        // 若已有進行中訂單，也要回覆提示（不要無聲 return）
-        if (activeOrder || state === "waiting_dispatch") {
-          await reply(replyToken, "你目前已有進行中訂單，若要重新叫車請先輸入「取消」");
-          return;
-        }
-
-        // 否則：引導叫車選單/追問目的地
         if (text.includes("叫車")) {
           setUserState(userId, "filling_form");
           await reply(
             replyToken,
-`❤️‍🔥雙北叫車格式❤️‍🔥
-___________________
+`❤️‍🔥加速派車格式❤️‍🔥
+
 日期：
 時間：
 上車：
@@ -206,63 +234,7 @@ ___________________
           );
           return;
         }
-
-        await reply(replyToken, "請問要去哪裡？（可直接回覆：從哪裡到哪裡/或依叫車格式）");
-        return;
-      }
-
-      // 取消：回 idle + 刪除訂單
-      if (text.includes("取消")) {
-        deleteOrderByCustomer(userId);
-        setUserState(userId, "idle");
-        await reply(replyToken, "已取消訂單");
-        return;
-      }
-
-      // 只有「叫車」才進流程
-      if (text.includes("叫車")) {
-        if (activeOrder || state === "filling_form" || state === "waiting_dispatch") {
-          await reply(replyToken, "你目前已有進行中訂單，若要重新叫車請先輸入「取消」");
-          return;
-        }
-
-        setUserState(userId, "filling_form");
-        await reply(
-          replyToken,
-`❤️‍🔥雙北叫車格式❤️‍🔥
-___________________
-日期：
-時間：
-上車：
-下車：
-人數：`
-        );
-        return;
-      }
-
-      // filling_form：表單需含 上車/下車 才視為完成
-      if (state === "filling_form") {
-        if (!text.includes("上車") || !text.includes("下車")) return;
-
-        const form = parseRideForm(text);
-        if (!form) return;
-
-        const order = createOrder(userId, form);
-        setUserState(userId, "waiting_dispatch", { orderId: order.orderId });
-
-        await reply(replyToken, "幫你安排司機中");
-
-        await pushText(
-          DRIVER_GROUP_ID,
-`（${order.pickup}）
-
-❤️‍🔥______R•S______❤️‍🔥
-💛5/2直2內100💛
-300回10%🧨600回15%
-🔥900回20%🔥
-♐上車:未指定走最短♐`
-        );
-
+        await reply(replyToken, "調度連線忙碌，請稍後再試；或直接回覆「從哪裡到哪裡、時間、人數」。");
         return;
       }
 
@@ -375,6 +347,64 @@ function deleteOrderByCustomer(customerId) {
   const activeStatuses = new Set(["waiting", "matched", "arrived", "onboard"]);
   const idx = orders.findIndex((o) => o.customerId === customerId && activeStatuses.has(o.status));
   if (idx >= 0) orders.splice(idx, 1);
+}
+
+function getDispatchDraft(userId) {
+  const d = users[userId]?.dispatchDraft;
+  if (!d || typeof d !== "object") {
+    return { date: "", time: "", pickup: "", dropoff: "", passengers: "" };
+  }
+  return {
+    date: String(d.date ?? "").trim(),
+    time: String(d.time ?? "").trim(),
+    pickup: String(d.pickup ?? "").trim(),
+    dropoff: String(d.dropoff ?? "").trim(),
+    passengers: String(d.passengers ?? "").trim()
+  };
+}
+
+function setDispatchDraft(userId, draft) {
+  setUserState(userId, getUserState(userId), { dispatchDraft: draft });
+}
+
+function clearDispatchDraft(userId) {
+  if (!users[userId]) return;
+  delete users[userId].dispatchDraft;
+}
+
+function mergeDispatchDraft(base, patch) {
+  const keys = ["date", "time", "pickup", "dropoff", "passengers"];
+  const out = { ...base };
+  for (const k of keys) {
+    const v = patch?.[k];
+    if (v != null && String(v).trim()) out[k] = String(v).trim();
+  }
+  return out;
+}
+
+function isDispatchDraftFilled(d) {
+  return ["date", "time", "pickup", "dropoff", "passengers"].every((k) => Boolean(d[k]?.trim()));
+}
+
+function buildAcceleratedDispatchFormat(d) {
+  return `❤️‍🔥加速派車格式❤️‍🔥
+
+日期：${d.date}
+時間：${d.time}
+上車：${d.pickup}
+下車：${d.dropoff}
+人數：${d.passengers}`;
+}
+
+function draftToRideForm(d, rawText) {
+  return {
+    pickup: d.pickup,
+    dropoff: d.dropoff,
+    time: d.time,
+    date: d.date || null,
+    passengers: d.passengers || null,
+    rawText
+  };
 }
 
 // ========================
