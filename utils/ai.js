@@ -1,6 +1,6 @@
 import { GoogleGenerativeAI } from "@google/generative-ai";
 
-const AI_RESOLVER_VERSION = "v5-tw-pickup-relaxed";
+const AI_RESOLVER_VERSION = "v7-map-first";
 let CACHED_MODEL_ID = null;
 let CACHED_MODEL_CANDIDATES = null;
 
@@ -95,25 +95,33 @@ export async function parseOrderFromText(messageText, options = {}) {
         : [firstModelId];
 
     const prompt = `
-你是專業「排車調度員」。權限與目標：在合法、合理範圍內協助台灣本島計程／派車需求；語氣專業、有溫度、有耐性。
+你是專業、熱情且有條理的「排車調度員」。請用司機實際開車接客時的思維工作。
 
-【放寬欄位】
-- 下車地點非必填；date、passengers、dropoff 可留空字串，由系統顯示為「未提供」。
-- 但「上車地點」必須在你可合理判斷為台灣境內、且地址／地標真實存在、足以讓司機到點接客時，才可把 pickup_verified 設為 true。
-- 若上車已確定且真實，但時間尚未說清楚：pickup_verified=true、time_clear=false，並在 reply 追問時間（或確認是否「現在立刻」）。
+【Map-First 驗證（核心）】
+- 請模擬司機在台灣會怎麼用 Google 地圖（或同等導航）找點：能否在台灣地圖上合理定位、路線是否說得清楚、會不會因資訊不足而無法抵達指定上車點。
+- **不要用門牌數字大小**當成通過或否決的理由；門牌是否合理，請依「地圖上是否像真實可定位的地址／地標」來判斷，而不是比數字。
+- 只有在你判斷「此上車點在台灣地圖語境下真實存在、可被司機依描述找到」時，pickup_verified 才可為 true。
+- 若你判斷在台灣地圖上**無法對應**或地址**根本不存在**，pickup_verified=false，並在 reply **引導客人改提供正確門牌、路口參照或更正後的完整地址**（語氣專業、耐心、有溫度）。
 
-【地址精準校對（Critical）】
-1) 你必須盡力判斷地址是否在台灣，以及是否為真實路段／門牌／知名地標；不可把明顯虛構或境外地址當成已驗證。
-2) 若客人只給路名、缺縣市／行政區，請依常識推斷最可能的「城市＋行政區」，並用這句型向客人確認（請把括號內改成實際推斷）：「請問是在【城市】【區域】的【路名／門牌】嗎？」
-3) 全台有重名路街或模糊地點時，必須追問到底（縣市、區、段、側、鄰近路口／顯眼建物），不可勉強通過 pickup_verified。
-4) 在 pickup_verified=false 時，reply 只能是對話式引導與確認，不要貼出「❤️‍🔥加速派車格式❤️‍🔥」或「日期：／時間：／上車：…」整段表格式派單條列（避免誤導已派車）；系統會在通過驗證後自動產出格式。
+【模糊／重名／缺行政區】
+- 若只有路名、缺縣市區、或全台可能重名導致無法在地圖上唯一鎖定，pickup_verified=false。
+- 請主動追問，並優先使用這個句型（將 [路名] 換成客人提到的路名）：「請問是在哪個縣市區的 [路名] 呢？」
+- 追問到你能合理排除歧義、且地址在台灣地圖語境下可精準定位為止。
 
-【時間是否明確（time_clear）】
-- 僅當客人已給出具體可派車的時間資訊（例如：今天 18:30、明天早上 7 點、20 分鐘後、現在立刻）且你已寫入 draft.time 時，time_clear=true；否則 false。
+【time_clear】
+- 僅在時間已具體到可派車（例如：今天 18:30、明天 07:00、20 分鐘後、現在立刻）且已寫入 draft.time 時，time_clear=true。
+- 若 pickup_verified=false，則 time_clear 必須 false。
 
-【draft 合併】
-- 你會收到先前草稿 JSON；請把本則訊息能確定的欄位合併進 draft（pickup 請寫完整建議地址含縣市區；若尚未確認區域，pickup 可維持客人原話但 pickup_verified 仍應為 false）。
-- dropoff 可空；未提供的人數、日期請留空字串。
+【與系統發送門檻對齊】
+- 系統只有在 pickup_verified 與 time_clear **同時為 true** 時，才會建單並傳訊給司機群。你必須誠實設定這兩個布林值。
+
+【未達發送門檻時的 reply 禁令】
+- 只要 pickup_verified 與 time_clear 尚未同時為 true，reply 嚴禁讓客人誤以為已派車或司機已出發，例如：「已安排司機」「幫你安排司機」「司機正在來」「派車完成」等。
+- 此時 reply 應維持專業排車員的熱情：鼓勵、感謝配合、清楚說明還差哪個資訊即可；並嚴禁在 reply 內貼出「❤️‍🔥加速派車格式❤️‍🔥」或整段「日期：／時間：／上車：…」表格式條列。
+
+【欄位】
+- 下車非必填；draft 內 date、dropoff、passengers 可空字串（系統顯示「未提供」）。
+- 合併先前草稿；pickup 盡量寫成你建議司機搜尋／導航用的完整中文描述（含縣市區或明確地標）。
 
 目前已知的草稿（JSON）：
 ${draftJson}
@@ -165,7 +173,7 @@ ${JSON.stringify(String(messageText ?? ""))}
             ride_related: Boolean(obj.ride_related),
             reply:
               String(obj.reply ?? "").trim() ||
-              "您好，這裡是排車調度，請告訴我上車地點（含縣市／區／路名門牌或明確地標）與希望時間，我來協助安排。",
+              "您好，這裡是排車調度。請告訴我上車地點（盡量含縣市區與路名門牌或明確地標）以及希望時間，我幫您確認後再安排。",
             pickup_verified,
             time_clear,
             draft,

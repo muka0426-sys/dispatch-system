@@ -160,17 +160,21 @@ async function handleEvent(event) {
         setDispatchDraft(userId, merged);
       }
 
-      const pickupReadyForCard =
-        Boolean(ai?.pickup_verified) && Boolean(merged.pickup?.trim());
-      const driverReady =
-        Boolean(ai?.pickup_verified) &&
+      const pickupBlockReason = pickupEmptyBlockReason(merged.pickup);
+      const effectivePickupVerified =
+        Boolean(ai?.pickup_verified) && !pickupBlockReason && Boolean(merged.pickup?.trim());
+      const effectiveTimeClear =
         Boolean(ai?.time_clear) &&
-        Boolean(merged.pickup?.trim()) &&
+        serverTimeLooksConcrete(merged.time) &&
         Boolean(merged.time?.trim());
+
+      const driverReady =
+        Boolean(ai) && effectivePickupVerified && effectiveTimeClear;
 
       if (driverReady) {
         const finalBlock = buildAcceleratedDispatchFormat(merged);
-        const customerMsg = [ai.reply, finalBlock].filter(Boolean).join("\n\n");
+        const safeLead = stripDispatchMisleadingPhrases(ai.reply);
+        const customerMsg = [safeLead, finalBlock].filter(Boolean).join("\n\n");
         await reply(replyToken, customerMsg);
 
         const form = draftToRideForm(merged, finalBlock);
@@ -182,39 +186,22 @@ async function handleEvent(event) {
         return;
       }
 
-      if (pickupReadyForCard) {
-        const finalBlock = buildAcceleratedDispatchFormat(merged);
-        const customerMsg = [ai.reply, finalBlock].filter(Boolean).join("\n\n");
-        await reply(replyToken, customerMsg);
-        if (text.includes("叫車") && getUserState(userId) === "idle") {
-          setUserState(userId, "filling_form");
-        }
-        return;
-      }
-
       if (state === "filling_form") {
         const legacyForm = parseRideForm(text);
         if (legacyForm) {
           const legacyDraft = legacyFormToDispatchDraft(legacyForm);
-          if (!legacyDraft.pickup?.trim() || !legacyDraft.time?.trim()) {
-            await reply(replyToken, "請至少提供「上車地點」與「時間」，下車可稍後再補或寫未提供。");
-            return;
-          }
-          const finalBlock = buildAcceleratedDispatchFormat(legacyDraft);
-          clearDispatchDraft(userId);
-          const order = createOrder(userId, draftToRideForm(legacyDraft, finalBlock));
-          setUserState(userId, "waiting_dispatch", { orderId: order.orderId });
+          const mergedFromLegacy = mergeDispatchDraft(merged, legacyDraft);
+          setDispatchDraft(userId, mergedFromLegacy);
           await reply(
             replyToken,
-            `已為您確認並送出派單，以下為本次行程資訊：\n\n${finalBlock}`
+            "已讀取您貼上的欄位。接下來仍須由調度依「地圖可定位」方式確認上車點，以及時間是否具體；**兩項都確認完成前，不會對司機群發送任何訊息**。請直接回覆要補充或確認的內容。"
           );
-          await pushText(DRIVER_GROUP_ID, finalBlock);
           return;
         }
       }
 
       if (ai) {
-        await reply(replyToken, ai.reply);
+        await reply(replyToken, sanitizeNonDispatchReply(ai.reply));
         if (text.includes("叫車") && getUserState(userId) === "idle") {
           setUserState(userId, "filling_form");
         }
@@ -382,6 +369,61 @@ function mergeDispatchDraft(base, patch) {
     if (v != null && String(v).trim()) out[k] = String(v).trim();
   }
   return out;
+}
+
+/** 僅擋「完全沒有上車文字」；地址真偽一律交給 AI 以地圖／導航思維判斷 pickup_verified。 */
+function pickupEmptyBlockReason(pickup) {
+  if (!String(pickup ?? "").trim()) return "缺少上車地址";
+  return null;
+}
+
+function serverTimeLooksConcrete(time) {
+  const t = String(time ?? "").trim();
+  if (t.length < 2) return false;
+  if (
+    /待會|等等|稍後|不確定|隨時|儘快|越快越好|看一下|再說|晚點|等等看|不曉得|不知道|可能|大概|應該|之後|有空|方便時/.test(
+      t
+    )
+  ) {
+    return false;
+  }
+  if (/\d/.test(t)) return true;
+  if (/現在|立刻|馬上|立即|當下|隨時可走/.test(t)) return true;
+  return false;
+}
+
+function stripDispatchMisleadingPhrases(text) {
+  let t = String(text ?? "").trim();
+  if (!t) return "";
+  const banned = [
+    "幫你安排司機",
+    "幫您安排司機",
+    "幫你安排",
+    "幫您安排",
+    "已為您安排司機",
+    "已為你安排司機",
+    "已安排司機",
+    "已安排 司機",
+    "司機正在來",
+    "司機馬上到",
+    "派車完成",
+    "已派車",
+    "已送出派單"
+  ];
+  for (const b of banned) {
+    if (t.includes(b)) t = t.split(b).join("");
+  }
+  t = t.replace(/❤️‍🔥加速派車格式❤️‍🔥[\s\S]*/g, "").trim();
+  return t.replace(/\s{2,}/g, " ").trim();
+}
+
+function sanitizeNonDispatchReply(text) {
+  let t = stripDispatchMisleadingPhrases(text);
+  t = t.replace(/❤️‍🔥加速派車格式❤️‍🔥[\s\S]*/g, "").trim();
+  if (!t || t.length < 4) {
+    return "為確認可派車，請提供完整上車地址（縣市區＋路街門牌或明確地標）以及具體載客時間；若地址有疑義我會再向您核對，謝謝。";
+  }
+  return t;
 }
 
 function displayDispatchField(v) {
