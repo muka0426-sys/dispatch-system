@@ -4,10 +4,79 @@ const AI_RESOLVER_VERSION = "v7-map-first";
 let CACHED_MODEL_ID = null;
 let CACHED_MODEL_CANDIDATES = null;
 
+const REPLY_MAX_CHARS = 50;
+const REPLY_TARGET_MIN = 30;
+
 console.log("AI module loaded.", { AI_RESOLVER_VERSION, module: "utils/ai_v7.js" });
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+/** 繁中／emoji 友善字數（以 Unicode 字元計） */
+function clipReplyToMaxChars(text, max = REPLY_MAX_CHARS) {
+  const t = String(text ?? "").trim();
+  if (!t) return t;
+  const chars = [...t];
+  if (chars.length <= max) return t;
+  return chars.slice(0, Math.max(0, max - 1)).join("") + "…";
+}
+
+/** .cursorrules：盡量落在 30～50 字；過短時補一句不突兀的引導 */
+function ensureReplyLengthBand(text) {
+  const pad = "補一下地址或時間。";
+  let t = clipReplyToMaxChars(String(text ?? "").trim(), REPLY_MAX_CHARS);
+  if ([...t].length >= REPLY_TARGET_MIN) return t;
+  t = clipReplyToMaxChars(`${t} ${pad}`, REPLY_MAX_CHARS);
+  return t || clipReplyToMaxChars("收到，請補縣市區、路名門牌與時間。", REPLY_MAX_CHARS);
+}
+
+/**
+ * 依 .cursorrules：地圖優先、30～50 字、台灣派遣口語、EmotionScore、禁冗稱與誤導派車語。
+ */
+function buildSystemPrompt(draftJson, messageText) {
+  return `
+你是台灣派遣「排車調度」，口語像現場調度：簡短、清楚、不機械。禁用「親愛的顧客」等冗稱。
+
+【回覆長度（強制）】
+- reply 全文字數（含標點）必須在 ${REPLY_TARGET_MIN}～${REPLY_MAX_CHARS} 字之間；能更短更好，絕對不可超過 ${REPLY_MAX_CHARS} 字。
+
+【EmotionScore（0～100，整數）】
+- 依本則訊息判斷乘客情緒負荷：著急、重複催促、髒話、恐懼、抱怨等 → 分數偏高；平穩敘述地址／時間 → 偏低。
+- 疑似酒醉、意識不清、語無倫次、情緒失控 → emotion_score 至少 70。
+- 一般略急 → 約 35～55。
+- 冷靜明確 → 0～25。
+- 你必須輸出欄位 emotion_score（數字）。若 emotion_score ≥ 40，reply 內須含**一句極短安撫**（例如：先別急／我這邊幫你看），且仍須符合字數上限。
+
+【Map-First】
+- 以司機用導航能否在台灣精準到點思考；不依門牌數字大小否決。
+- pickup_verified=true 僅當地圖語境下地址真實可定位；模糊、重名、缺縣市區 → false，並用固定句型追問：「請問是在哪個縣市區的 [路名] 呢？」（[路名] 代入客人說的路）。
+- 地圖上不存在 → false，簡短請對方改門牌或補路口。
+- time_clear：時間具體可派車且寫入 draft.time 才 true；pickup_verified=false 則 time_clear 必 false。
+
+【發送門檻對齊】
+- pickup_verified 與 time_clear 尚未同時 true 時，reply 嚴禁「已安排司機」「幫你安排司機」「司機來了」「派車完成」等誤導；禁貼整段「❤️‍🔥加速派車格式」或表格式條列。
+
+【draft】
+- 合併草稿；下車可空。pickup 寫成方便搜尋的完整中文（含縣市區或明顯地標）。
+
+目前已知草稿（JSON）：
+${draftJson}
+
+客人本則訊息：
+${JSON.stringify(String(messageText ?? ""))}
+
+只輸出 JSON（無 markdown），格式：
+{
+  "ride_related": true|false,
+  "emotion_score": 0,
+  "reply": "",
+  "pickup_verified": true|false,
+  "time_clear": true|false,
+  "draft": { "date": "", "time": "", "pickup": "", "dropoff": "", "passengers": "" },
+  "missing": []
+}
+`.trim();
 }
 
 async function getAvailableModel(apiKey) {
@@ -59,6 +128,7 @@ function extractJsonObject(text) {
  * @param {{ draft?: Record<string,string> }} [options]
  * @returns {Promise<{
  *   ride_related: boolean,
+ *   emotion_score: number,
  *   reply: string,
  *   pickup_verified: boolean,
  *   time_clear: boolean,
@@ -94,51 +164,7 @@ export async function parseOrderFromText(messageText, options = {}) {
         ? CACHED_MODEL_CANDIDATES
         : [firstModelId];
 
-    const prompt = `
-你是專業、熱情且有條理的「排車調度員」。請用司機實際開車接客時的思維工作。
-
-【Map-First 驗證（核心）】
-- 請模擬司機在台灣會怎麼用 Google 地圖（或同等導航）找點：能否在台灣地圖上合理定位、路線是否說得清楚、會不會因資訊不足而無法抵達指定上車點。
-- **不要用門牌數字大小**當成通過或否決的理由；門牌是否合理，請依「地圖上是否像真實可定位的地址／地標」來判斷，而不是比數字。
-- 只有在你判斷「此上車點在台灣地圖語境下真實存在、可被司機依描述找到」時，pickup_verified 才可為 true。
-- 若你判斷在台灣地圖上**無法對應**或地址**根本不存在**，pickup_verified=false，並在 reply **引導客人改提供正確門牌、路口參照或更正後的完整地址**（語氣專業、耐心、有溫度）。
-
-【模糊／重名／缺行政區】
-- 若只有路名、缺縣市區、或全台可能重名導致無法在地圖上唯一鎖定，pickup_verified=false。
-- 請主動追問，並優先使用這個句型（將 [路名] 換成客人提到的路名）：「請問是在哪個縣市區的 [路名] 呢？」
-- 追問到你能合理排除歧義、且地址在台灣地圖語境下可精準定位為止。
-
-【time_clear】
-- 僅在時間已具體到可派車（例如：今天 18:30、明天 07:00、20 分鐘後、現在立刻）且已寫入 draft.time 時，time_clear=true。
-- 若 pickup_verified=false，則 time_clear 必須 false。
-
-【與系統發送門檻對齊】
-- 系統只有在 pickup_verified 與 time_clear **同時為 true** 時，才會建單並傳訊給司機群。你必須誠實設定這兩個布林值。
-
-【未達發送門檻時的 reply 禁令】
-- 只要 pickup_verified 與 time_clear 尚未同時為 true，reply 嚴禁讓客人誤以為已派車或司機已出發，例如：「已安排司機」「幫你安排司機」「司機正在來」「派車完成」等。
-- 此時 reply 應維持專業排車員的熱情：鼓勵、感謝配合、清楚說明還差哪個資訊即可；並嚴禁在 reply 內貼出「❤️‍🔥加速派車格式❤️‍🔥」或整段「日期：／時間：／上車：…」表格式條列。
-
-【欄位】
-- 下車非必填；draft 內 date、dropoff、passengers 可空字串（系統顯示「未提供」）。
-- 合併先前草稿；pickup 盡量寫成你建議司機搜尋／導航用的完整中文描述（含縣市區或明確地標）。
-
-目前已知的草稿（JSON）：
-${draftJson}
-
-客人本則訊息：
-${JSON.stringify(String(messageText ?? ""))}
-
-請只輸出 JSON（不要 markdown、不要多餘文字），格式如下：
-{
-  "ride_related": true|false,
-  "reply": "給客人的繁中回覆",
-  "pickup_verified": true|false,
-  "time_clear": true|false,
-  "draft": { "date": "", "time": "", "pickup": "", "dropoff": "", "passengers": "" },
-  "missing": ["仍缺或待確認的項目簡述"]
-}
-`.trim();
+    const systemPrompt = buildSystemPrompt(draftJson, messageText);
 
     let lastErr = null;
     for (let i = 0; i < Math.min(modelCandidates.length, 4); i++) {
@@ -147,7 +173,7 @@ ${JSON.stringify(String(messageText ?? ""))}
 
       for (let attempt = 0; attempt < 3; attempt++) {
         try {
-          const res = await model.generateContent(prompt);
+          const res = await model.generateContent(systemPrompt);
           const raw = res?.response?.text?.() ?? "";
           const obj = extractJsonObject(raw);
           if (!obj || typeof obj !== "object") throw new Error("AI output invalid");
@@ -169,11 +195,20 @@ ${JSON.stringify(String(messageText ?? ""))}
           let time_clear = Boolean(obj.time_clear) && Boolean(draft.time.trim());
           if (time_clear && !pickup_verified) time_clear = false;
 
+          const rawScore = Number(obj.emotion_score);
+          const emotion_score = Number.isFinite(rawScore)
+            ? Math.min(100, Math.max(0, Math.round(rawScore)))
+            : 0;
+
+          let reply =
+            String(obj.reply ?? "").trim() ||
+            "收到，請補縣市區、路名門牌，再加希望時間，謝謝。";
+          reply = ensureReplyLengthBand(reply);
+
           return {
             ride_related: Boolean(obj.ride_related),
-            reply:
-              String(obj.reply ?? "").trim() ||
-              "您好，這裡是排車調度。請告訴我上車地點（盡量含縣市區與路名門牌或明確地標）以及希望時間，我幫您確認後再安排。",
+            emotion_score,
+            reply,
             pickup_verified,
             time_clear,
             draft,
