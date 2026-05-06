@@ -68,8 +68,13 @@ function ensureJsonFileSync(path, defaultText = "{}") {
   }
 }
 
+// v0.3.6：啟動最前面就確保檔案真的存在（不要只 try-catch）
 ensureJsonFileSync(KB_FILE, "{}");
 ensureJsonFileSync(ALARMS_DB_FILE, "{}");
+if (!fs.existsSync(KB_FILE)) fs.writeFileSync(KB_FILE, "{}", "utf8");
+if (!fs.existsSync(ALARMS_DB_FILE)) fs.writeFileSync(ALARMS_DB_FILE, "{}", "utf8");
+
+console.log("--- v0.3.6 啟動成功，警報與解析已就緒 ---");
 
 async function ensureJsonFile(path) {
   try {
@@ -142,7 +147,7 @@ function scheduleAlarmFromRecord(r) {
   const t = setTimeout(async () => {
     try {
       await pushText(
-        ADMIN_GROUP_ID,
+        process.env.ADMIN_GROUP_ID,
         `⚠️ [假資警報] 訂單號 ${r.orderId} 發車倒數 1 小時，請立即指派真實司機！\n上車：${r.pickup}\n下車：${r.dropoff}`
       );
       clearAlarm(r.key);
@@ -244,11 +249,78 @@ async function handleEvent(event) {
       /\d{1,2}[\/\-]\d{1,2}/.test(text) ||
       /(今天|明天|\d{1,2}\s*號)/.test(text);
 
+    const hasAirportKeyword = /(送機|接機)/.test(text);
+    const hasLocationKeyword =
+      /(到|->|從|上車|下車|板橋|桃機|機場|台北|新北|區|路|街|巷|號)/.test(text);
+
+    const shouldParseAi = (hasAirportKeyword || hasTimeKeyword || hasDateKeyword) && hasLocationKeyword;
+
+    // v0.3.6 審查修復：AI 解析只做一次，任何來源都不被 group return 擋掉
+    let aiResult = null;
+    if (
+      shouldParseAi &&
+      !(
+        sourceType === "group" &&
+        process.env.ADMIN_GROUP_ID &&
+        event.source?.groupId === process.env.ADMIN_GROUP_ID &&
+        text.startsWith("/報價")
+      )
+    ) {
+      console.log("[AI] parseOrderFromText() input:", text);
+      aiResult = await parseOrderFromText(text, {
+        draft: { date: "", time: "", pickup: "", dropoff: "", passengers: "" }
+      });
+      console.log("[AI] Result:", aiResult);
+    }
+
     // =========================
     // 👮 管理員群（動態教導）
     // =========================
+    // v0.3.6 審查修復：假資警報（任何來源，只要 AI 解析到 is_fake+ride_timestamp）
+    if (aiResult?.is_fake && aiResult?.ride_timestamp && process.env.ADMIN_GROUP_ID) {
+      const rideTimestamp = aiResult.ride_timestamp;
+      const rideMs = Date.parse(rideTimestamp);
+      if (Number.isFinite(rideMs) && rideMs > Date.now()) {
+        const remainingMs = rideMs - Date.now();
+        const key = `${sourceType}_${event.source?.groupId || event.source?.userId}_${rideMs}`;
+        const pickup = aiResult?.draft?.pickup || "未提供";
+        const dropoff = aiResult?.draft?.dropoff || "未提供";
+
+        console.log("[Alarm] is_fake=true, ride_timestamp:", rideTimestamp, "remainingMs:", remainingMs);
+
+        if (remainingMs <= 60 * 60_000) {
+          console.log("[Alarm] immediate push to ADMIN_GROUP_ID");
+          await pushText(
+            process.env.ADMIN_GROUP_ID,
+            `⚠️ [假資警報] 訂單號 ${key} 發車倒數 1 小時，請立即指派真實司機！\n上車：${pickup}\n下車：${dropoff}`
+          );
+        } else {
+          console.log("[Alarm] schedule timer + persist");
+          scheduleAlarmFromRecord({
+            key,
+            orderId: key,
+            customerId: String(event.source?.groupId || event.source?.userId || ""),
+            pickup,
+            dropoff,
+            rideTimestampMs: rideMs,
+            createdAtMs: Date.now()
+          });
+          upsertAlarmRecord({
+            key,
+            orderId: key,
+            customerId: String(event.source?.groupId || event.source?.userId || ""),
+            pickup,
+            dropoff,
+            rideTimestampMs: rideMs,
+            createdAtMs: Date.now()
+          }).catch((e) => console.error("[upsertAlarmRecord]", e?.message || e));
+          console.log("[Timer] 成功設定假資警報，目標時間:", rideTimestamp);
+        }
+      }
+    }
+
     if (sourceType === "group") {
-      if (ADMIN_GROUP_ID && event.source.groupId === ADMIN_GROUP_ID) {
+      if (process.env.ADMIN_GROUP_ID && event.source.groupId === process.env.ADMIN_GROUP_ID) {
         if (text.startsWith("/報價")) {
           const m = text.match(/^\/報價\s+(\d+)(?:\s+(fix))?\s*$/);
           const amount = m ? Number(m[1]) : NaN;
@@ -292,55 +364,8 @@ async function handleEvent(event) {
         return;
       }
 
-      // v0.3.5：非司機群/非管理群的群組訊息，只要含日期/時間就跑 AI 解析（假資警報用）
+      // v0.3.6：此處不再做第二次 AI 解析；AI 已在上方 shouldParseAi 區塊統一處理
       if (event.source.groupId !== DRIVER_GROUP_ID) {
-        if (hasTimeKeyword || hasDateKeyword) {
-          const result = await parseOrderFromText(text, {
-            draft: { date: "", time: "", pickup: "", dropoff: "", passengers: "" }
-          });
-          console.log("[AI] Result:", result);
-
-          const rideTimestamp = result?.ride_timestamp;
-          const isFake = Boolean(result?.is_fake);
-          const rideMs = rideTimestamp ? Date.parse(rideTimestamp) : NaN;
-
-          if (ADMIN_GROUP_ID && isFake && Number.isFinite(rideMs) && rideMs > Date.now()) {
-            const remainingMs = rideMs - Date.now();
-            const key = `G_${event.source.groupId}_${rideMs}`;
-            const pickup = result?.draft?.pickup || "未提供";
-            const dropoff = result?.draft?.dropoff || "未提供";
-
-            if (remainingMs <= 60 * 60_000) {
-              await pushText(
-                ADMIN_GROUP_ID,
-                `⚠️ [假資警報] 訂單號 ${key} 發車倒數 1 小時，請立即指派真實司機！\n上車：${pickup}\n下車：${dropoff}`
-              );
-              return;
-            }
-
-            // 轉成 alarm record（持久化 + timer）
-            scheduleAlarmFromRecord({
-              key,
-              orderId: key,
-              customerId: event.source.groupId,
-              pickup,
-              dropoff,
-              rideTimestampMs: rideMs,
-              createdAtMs: Date.now()
-            });
-            upsertAlarmRecord({
-              key,
-              orderId: key,
-              customerId: event.source.groupId,
-              pickup,
-              dropoff,
-              rideTimestampMs: rideMs,
-              createdAtMs: Date.now()
-            }).catch((e) => console.error("[upsertAlarmRecord]", e?.message || e));
-
-            console.log("[Timer] 成功設定假資警報，目標時間:", rideTimestamp);
-          }
-        }
         return;
       }
       if (orders.length === 0) return;
@@ -548,8 +573,8 @@ async function handleEvent(event) {
               `系統最短：${baselineKm}km / $${baselineFare}\n` +
               `司機回報：${reportedKm}km / $${reportedFare}\n` +
               `差額：$${Math.round(diffFare)}；里程偏差：${Math.round(kmDeviationRate * 100)}%`;
-            if (ADMIN_GROUP_ID) {
-              await pushText(ADMIN_GROUP_ID, adminMsg);
+            if (process.env.ADMIN_GROUP_ID) {
+              await pushText(process.env.ADMIN_GROUP_ID, adminMsg);
             } else {
               console.error("[ADMIN_GROUP_ID] unset, admin message:", adminMsg);
             }
@@ -650,7 +675,7 @@ async function handleEvent(event) {
       }
 
       // v0.3.0：未建檔路線 → 轉管理員報價（暫停對客回覆）
-      if (ai?.needs_admin_pricing && ADMIN_GROUP_ID) {
+      if (ai?.needs_admin_pricing && process.env.ADMIN_GROUP_ID) {
         const pickup = merged.pickup;
         const dropoff = merged.dropoff;
         const key = routeKey(pickup, dropoff);
@@ -665,7 +690,7 @@ async function handleEvent(event) {
           confirmAmount: null
         });
         await pushText(
-          ADMIN_GROUP_ID,
+          process.env.ADMIN_GROUP_ID,
           `🆘 [未建檔路線求報價]\n上車：${pickup}\n下車：${dropoff}\n系統估計：${est ? `${est.km}km / $${est.fare}` : "未取得"}\n請回覆：/報價 {金額}（臨時） 或 /報價 {金額} fix（永久）`
         );
         return;
@@ -708,7 +733,7 @@ async function handleEvent(event) {
         const order = createOrder(userId, form);
 
         // v0.3.0：假資預約單倒數警報（is_fake + ride_timestamp）
-        if (order.isFake && order.rideTimestampMs && ADMIN_GROUP_ID) {
+        if (order.isFake && order.rideTimestampMs && process.env.ADMIN_GROUP_ID) {
           scheduleFakeReservationAlert(order);
         }
 
@@ -777,45 +802,48 @@ function scheduleFakeReservationAlert(order) {
     if (!order?.rideTimestampMs) return;
     clearAlarm(order.orderId);
     const fireAt = Number(order.rideTimestampMs) - 60 * 60_000;
-    const delay = fireAt - Date.now();
+    let delay = fireAt - Date.now();
     if (!Number.isFinite(delay)) return;
 
-    // v0.3.4：不足 60 分鐘 → 立刻警報（不進 timer）
-    if (delay <= 0 && Number(order.rideTimestampMs) > Date.now() && ADMIN_GROUP_ID && order.isFake) {
-      pushText(
-        process.env.ADMIN_GROUP_ID,
-        `⚠️ [假資警報] 訂單號 ${order.orderId} 發車倒數 1 小時，請立即指派真實司機！\n上車：${order.pickup}\n下車：${order.dropoff}`
-      ).catch((e) => console.error("[fakeAlertImmediate]", e?.message || e));
-      deleteAlarmRecord(String(order.orderId)).catch((e) => console.error("[deleteAlarmRecord]", e?.message || e));
-      return;
-    }
-    if (delay <= 0) return;
-
-    if (order.fakeAlertTimer) clearTimeout(order.fakeAlertTimer);
-    order.fakeAlertTimer = setTimeout(async () => {
-      try {
-        if (!order.isFake) return;
-        await pushText(
-          ADMIN_GROUP_ID,
+    // v0.3.6：不足 60 分鐘 → 立刻警報（不等待、不 return）
+    if (delay <= 0) {
+      if (Number(order.rideTimestampMs) > Date.now() && process.env.ADMIN_GROUP_ID && order.isFake) {
+        pushText(
+          process.env.ADMIN_GROUP_ID,
           `⚠️ [假資警報] 訂單號 ${order.orderId} 發車倒數 1 小時，請立即指派真實司機！\n上車：${order.pickup}\n下車：${order.dropoff}`
-        );
-        await deleteAlarmRecord(String(order.orderId));
-      } catch (e) {
-        console.error("[fakeAlertTimer]", e?.message || e);
+        ).catch((e) => console.error("[fakeAlertImmediate]", e?.message || e));
+        deleteAlarmRecord(String(order.orderId)).catch((e) => console.error("[deleteAlarmRecord]", e?.message || e));
       }
-    }, delay);
-    activeAlarms.set(order.orderId, order.fakeAlertTimer);
-    upsertAlarmRecord({
-      key: String(order.orderId),
-      orderId: String(order.orderId),
-      customerId: String(order.customerId),
-      pickup: String(order.pickup ?? ""),
-      dropoff: String(order.dropoff ?? ""),
-      rideTimestampMs: Number(order.rideTimestampMs),
-      createdAtMs: Date.now()
-    }).catch((e) => console.error("[upsertAlarmRecord]", e?.message || e));
+      delay = 0;
+    }
 
-    console.log("[Timer] 成功設定假資警報，目標時間:", order.rideTimestamp);
+    if (delay > 0) {
+      if (order.fakeAlertTimer) clearTimeout(order.fakeAlertTimer);
+      order.fakeAlertTimer = setTimeout(async () => {
+        try {
+          if (!order.isFake) return;
+          await pushText(
+            process.env.ADMIN_GROUP_ID,
+            `⚠️ [假資警報] 訂單號 ${order.orderId} 發車倒數 1 小時，請立即指派真實司機！\n上車：${order.pickup}\n下車：${order.dropoff}`
+          );
+          await deleteAlarmRecord(String(order.orderId));
+        } catch (e) {
+          console.error("[fakeAlertTimer]", e?.message || e);
+        }
+      }, delay);
+      activeAlarms.set(order.orderId, order.fakeAlertTimer);
+      upsertAlarmRecord({
+        key: String(order.orderId),
+        orderId: String(order.orderId),
+        customerId: String(order.customerId),
+        pickup: String(order.pickup ?? ""),
+        dropoff: String(order.dropoff ?? ""),
+        rideTimestampMs: Number(order.rideTimestampMs),
+        createdAtMs: Date.now()
+      }).catch((e) => console.error("[upsertAlarmRecord]", e?.message || e));
+
+      console.log("[Timer] 成功設定假資警報，目標時間:", order.rideTimestamp);
+    }
   } catch (e) {
     console.error("[scheduleFakeReservationAlert]", e?.message || e);
   }

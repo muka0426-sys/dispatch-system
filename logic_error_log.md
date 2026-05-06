@@ -247,3 +247,23 @@
   - 啟動印 `[System] ADMIN_GROUP_ID: ...`
   - 解析印 `[AI] Result: ...`
 
+### v0.3.6 啟動不崩潰 + 所有群組含日期/送接機必解析 + 60分鐘內即時警報
+- **時間**：2026-05-07 03:53 UTC+8
+- **版本/分支**：package.json@0.3.6
+- **模組/範圍**：server.js
+- **修復**：
+  - 啟動最前面用 `fs.existsSync` + `fs.writeFileSync` 確保 `alarms_db.json`/`knowledge_base.json` 一定存在
+  - 群組/個人訊息只要含日期或「送機/接機」關鍵字，先跑 `parseOrderFromText`，避免 return 造成解析斷點
+  - `scheduleFakeReservationAlert` 在 60 分鐘內會直接推送假資警報到 `process.env.ADMIN_GROUP_ID`，不等待 timer
+- **日誌**：
+  - `--- v0.3.6 啟動成功，警報與解析已就緒 ---`
+
+### v0.3.6 全案審查修復：群組不攔截 + 統一 ADMIN_GROUP_ID + Debug
+- **時間**：2026-05-07 03:55 UTC+8
+- **版本/分支**：package.json@0.3.6
+- **模組/範圍**：server.js（AI 解析入口/警報推播/日誌）
+- **修復要點**：
+  - AI 解析改為「先判斷 shouldParseAi → 只解析一次」並置於所有 group 分支 return 之前，確保群組訊息不會被攔截而跳過解析
+  - 假資警報推播全面改用 `process.env.ADMIN_GROUP_ID`（避免常數/環境變數混用）
+  - 增加解析與警報關鍵日誌（解析 input/result、alarm immediate/schedule）
+
