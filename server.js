@@ -56,8 +56,18 @@ const pendingAdminPricing = []; // FIFO: { route_key, pickup, dropoff, customerI
 const ALARMS_DB_FILE = "alarms_db.json";
 let alarmsDb = { alarms: {} };
 
+async function ensureJsonFile(path) {
+  try {
+    await readFile(path, "utf8");
+  } catch (e) {
+    if (e?.code !== "ENOENT") throw e;
+    await writeFile(path, "{}", "utf8");
+  }
+}
+
 async function loadKnowledgeBase() {
   try {
+    await ensureJsonFile(KB_FILE);
     const raw = await readFile(KB_FILE, "utf8");
     const obj = JSON.parse(raw);
     knowledgeBase = { routes: obj?.routes && typeof obj.routes === "object" ? obj.routes : {} };
@@ -83,6 +93,7 @@ function routeKey(pickup, dropoff) {
 
 async function loadAlarmsDb() {
   try {
+    await ensureJsonFile(ALARMS_DB_FILE);
     const raw = await readFile(ALARMS_DB_FILE, "utf8");
     const obj = JSON.parse(raw);
     alarmsDb = { alarms: obj?.alarms && typeof obj.alarms === "object" ? obj.alarms : {} };
@@ -166,7 +177,15 @@ async function replyOnceToCustomer(customerId, text) {
 app.get("/", (_, res) => res.send("ok"));
 app.get("/health", (_, res) => res.json({ ok: true }));
 
-bootLoadAlarms();
+(async () => {
+  try {
+    await ensureJsonFile(KB_FILE);
+    await ensureJsonFile(ALARMS_DB_FILE);
+  } catch (e) {
+    console.error("[ensureJsonFile]", e?.message || e);
+  }
+  bootLoadAlarms();
+})();
 
 // ========================
 app.post("/webhook", (req, res) => {
