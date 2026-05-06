@@ -235,3 +235,15 @@
   - `[AI] 原始解析結果: ...`
   - `[Timer] 成功設定假資警報，目標時間: ...`
 
+### v0.3.5 Railway 啟動防呆 + callback 路由 + 群組含日期必解析
+- **時間**：2026-05-07 03:42 UTC+8
+- **版本/分支**：package.json@0.3.5
+- **模組/範圍**：server.js
+- **修復**：
+  - 啟動時用 `fs.writeFileSync` 同步建立缺失的 `alarms_db.json` / `knowledge_base.json`（避免 Railway 首次部署崩潰）
+  - 新增 `/callback` 路由別名（與 `/webhook` 同一 handler），避免 LINE Webhook 路徑不一致造成邏輯斷點
+  - 群組訊息只要包含日期/時間格式即強制跑 `parseOrderFromText`（假資警報不中斷）
+- **日誌**：
+  - 啟動印 `[System] ADMIN_GROUP_ID: ...`
+  - 解析印 `[AI] Result: ...`
+

@@ -1,6 +1,7 @@
 import "dotenv/config";
 import express from "express";
 import { pushText } from "./utils/line.js";
+import fs from "node:fs";
 import { appendFile, readFile, writeFile } from "node:fs/promises";
 import {
   parseOrderFromText,
@@ -22,7 +23,7 @@ console.log("[boot] server.js", {
   cwd: process.cwd()
 });
 
-console.log("[System] 目前 ADMIN_GROUP_ID 為:", process.env.ADMIN_GROUP_ID);
+console.log("[System] ADMIN_GROUP_ID:", process.env.ADMIN_GROUP_ID);
 
 const app = express();
 app.use(express.json());
@@ -57,6 +58,18 @@ const pendingAdminPricing = []; // FIFO: { route_key, pickup, dropoff, customerI
 
 const ALARMS_DB_FILE = "alarms_db.json";
 let alarmsDb = { alarms: {} };
+
+// v0.3.5：Railway 啟動防呆（同步建立缺失 JSON 檔）
+function ensureJsonFileSync(path, defaultText = "{}") {
+  try {
+    if (!fs.existsSync(path)) fs.writeFileSync(path, defaultText, "utf8");
+  } catch (e) {
+    console.error("[ensureJsonFileSync]", path, e?.message || e);
+  }
+}
+
+ensureJsonFileSync(KB_FILE, "{}");
+ensureJsonFileSync(ALARMS_DB_FILE, "{}");
 
 async function ensureJsonFile(path) {
   try {
@@ -190,11 +203,14 @@ app.get("/health", (_, res) => res.json({ ok: true }));
 })();
 
 // ========================
-app.post("/webhook", (req, res) => {
+function webhookHandler(req, res) {
   res.sendStatus(200);
   const events = req.body.events || [];
   for (const event of events) handleEvent(event);
-});
+}
+
+app.post("/webhook", webhookHandler);
+app.post("/callback", webhookHandler);
 
 // ========================
 async function handleEvent(event) {
@@ -223,6 +239,10 @@ async function handleEvent(event) {
       /(今天|明天)\s*(凌晨|半夜)?\s*\d{1,2}/.test(text) ||
       /\d{1,2}\s*號\s*(凌晨|半夜)\s*\d{1,2}\s*點/.test(text) ||
       /\d{1,2}[\/\-]\d{1,2}\s*(凌晨|半夜)\s*\d{1,2}\s*點/.test(text);
+
+    const hasDateKeyword =
+      /\d{1,2}[\/\-]\d{1,2}/.test(text) ||
+      /(今天|明天|\d{1,2}\s*號)/.test(text);
 
     // =========================
     // 👮 管理員群（動態教導）
@@ -272,13 +292,13 @@ async function handleEvent(event) {
         return;
       }
 
-      // v0.3.4：非司機群/非管理群的群組訊息，只要含時間關鍵字也要跑 AI 解析（假資警報用）
+      // v0.3.5：非司機群/非管理群的群組訊息，只要含日期/時間就跑 AI 解析（假資警報用）
       if (event.source.groupId !== DRIVER_GROUP_ID) {
-        if (hasTimeKeyword) {
+        if (hasTimeKeyword || hasDateKeyword) {
           const result = await parseOrderFromText(text, {
             draft: { date: "", time: "", pickup: "", dropoff: "", passengers: "" }
           });
-          console.log("[AI] 原始解析結果:", JSON.stringify(result, null, 2));
+          console.log("[AI] Result:", result);
 
           const rideTimestamp = result?.ride_timestamp;
           const isFake = Boolean(result?.is_fake);
@@ -763,7 +783,7 @@ function scheduleFakeReservationAlert(order) {
     // v0.3.4：不足 60 分鐘 → 立刻警報（不進 timer）
     if (delay <= 0 && Number(order.rideTimestampMs) > Date.now() && ADMIN_GROUP_ID && order.isFake) {
       pushText(
-        ADMIN_GROUP_ID,
+        process.env.ADMIN_GROUP_ID,
         `⚠️ [假資警報] 訂單號 ${order.orderId} 發車倒數 1 小時，請立即指派真實司機！\n上車：${order.pickup}\n下車：${order.dropoff}`
       ).catch((e) => console.error("[fakeAlertImmediate]", e?.message || e));
       deleteAlarmRecord(String(order.orderId)).catch((e) => console.error("[deleteAlarmRecord]", e?.message || e));
