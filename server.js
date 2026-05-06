@@ -22,6 +22,8 @@ console.log("[boot] server.js", {
   cwd: process.cwd()
 });
 
+console.log("[System] 目前 ADMIN_GROUP_ID 為:", process.env.ADMIN_GROUP_ID);
+
 const app = express();
 app.use(express.json());
 
@@ -216,6 +218,12 @@ async function handleEvent(event) {
     console.log("收到訊息來源 ID:", event.source?.groupId || event.source?.userId);
     console.log("📩", sourceType, text);
 
+    const hasTimeKeyword =
+      /(\d{1,2}[\/\-]\d{1,2}\s*\d{1,2}:\d{2})/.test(text) ||
+      /(今天|明天)\s*(凌晨|半夜)?\s*\d{1,2}/.test(text) ||
+      /\d{1,2}\s*號\s*(凌晨|半夜)\s*\d{1,2}\s*點/.test(text) ||
+      /\d{1,2}[\/\-]\d{1,2}\s*(凌晨|半夜)\s*\d{1,2}\s*點/.test(text);
+
     // =========================
     // 👮 管理員群（動態教導）
     // =========================
@@ -264,7 +272,57 @@ async function handleEvent(event) {
         return;
       }
 
-      if (event.source.groupId !== DRIVER_GROUP_ID) return;
+      // v0.3.4：非司機群/非管理群的群組訊息，只要含時間關鍵字也要跑 AI 解析（假資警報用）
+      if (event.source.groupId !== DRIVER_GROUP_ID) {
+        if (hasTimeKeyword) {
+          const result = await parseOrderFromText(text, {
+            draft: { date: "", time: "", pickup: "", dropoff: "", passengers: "" }
+          });
+          console.log("[AI] 原始解析結果:", JSON.stringify(result, null, 2));
+
+          const rideTimestamp = result?.ride_timestamp;
+          const isFake = Boolean(result?.is_fake);
+          const rideMs = rideTimestamp ? Date.parse(rideTimestamp) : NaN;
+
+          if (ADMIN_GROUP_ID && isFake && Number.isFinite(rideMs) && rideMs > Date.now()) {
+            const remainingMs = rideMs - Date.now();
+            const key = `G_${event.source.groupId}_${rideMs}`;
+            const pickup = result?.draft?.pickup || "未提供";
+            const dropoff = result?.draft?.dropoff || "未提供";
+
+            if (remainingMs <= 60 * 60_000) {
+              await pushText(
+                ADMIN_GROUP_ID,
+                `⚠️ [假資警報] 訂單號 ${key} 發車倒數 1 小時，請立即指派真實司機！\n上車：${pickup}\n下車：${dropoff}`
+              );
+              return;
+            }
+
+            // 轉成 alarm record（持久化 + timer）
+            scheduleAlarmFromRecord({
+              key,
+              orderId: key,
+              customerId: event.source.groupId,
+              pickup,
+              dropoff,
+              rideTimestampMs: rideMs,
+              createdAtMs: Date.now()
+            });
+            upsertAlarmRecord({
+              key,
+              orderId: key,
+              customerId: event.source.groupId,
+              pickup,
+              dropoff,
+              rideTimestampMs: rideMs,
+              createdAtMs: Date.now()
+            }).catch((e) => console.error("[upsertAlarmRecord]", e?.message || e));
+
+            console.log("[Timer] 成功設定假資警報，目標時間:", rideTimestamp);
+          }
+        }
+        return;
+      }
       if (orders.length === 0) return;
 
       const waitingOrder = getNextWaitingOrder();
@@ -700,7 +758,18 @@ function scheduleFakeReservationAlert(order) {
     clearAlarm(order.orderId);
     const fireAt = Number(order.rideTimestampMs) - 60 * 60_000;
     const delay = fireAt - Date.now();
-    if (!Number.isFinite(delay) || delay <= 0) return;
+    if (!Number.isFinite(delay)) return;
+
+    // v0.3.4：不足 60 分鐘 → 立刻警報（不進 timer）
+    if (delay <= 0 && Number(order.rideTimestampMs) > Date.now() && ADMIN_GROUP_ID && order.isFake) {
+      pushText(
+        ADMIN_GROUP_ID,
+        `⚠️ [假資警報] 訂單號 ${order.orderId} 發車倒數 1 小時，請立即指派真實司機！\n上車：${order.pickup}\n下車：${order.dropoff}`
+      ).catch((e) => console.error("[fakeAlertImmediate]", e?.message || e));
+      deleteAlarmRecord(String(order.orderId)).catch((e) => console.error("[deleteAlarmRecord]", e?.message || e));
+      return;
+    }
+    if (delay <= 0) return;
 
     if (order.fakeAlertTimer) clearTimeout(order.fakeAlertTimer);
     order.fakeAlertTimer = setTimeout(async () => {
@@ -725,6 +794,8 @@ function scheduleFakeReservationAlert(order) {
       rideTimestampMs: Number(order.rideTimestampMs),
       createdAtMs: Date.now()
     }).catch((e) => console.error("[upsertAlarmRecord]", e?.message || e));
+
+    console.log("[Timer] 成功設定假資警報，目標時間:", order.rideTimestamp);
   } catch (e) {
     console.error("[scheduleFakeReservationAlert]", e?.message || e);
   }

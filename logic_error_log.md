@@ -222,3 +222,16 @@
   - 新增 `alarms_db.json`：每次設定假資預約單警報時寫入（orderId、rideTimestampMs、pickup/dropoff、customerId）
   - 伺服器啟動時 `bootLoadAlarms()` 會讀取 `alarms_db.json`，過濾過期後重掛剩餘 alarms，避免重啟造成警報遺失
 
+### v0.3.4 群組全量解析 + 假資即時警報 + Debug Logs
+- **時間**：2026-05-07 03:37 UTC+8
+- **版本/分支**：package.json@0.3.4
+- **模組/範圍**：server.js、utils/ai_v7.js（沿用時間解析）
+- **修復**：
+  - 非司機群/非管理群的群組訊息，只要含時間格式就強制呼叫 `parseOrderFromText`，避免群組訊息被提早 return 導致不解析
+  - 假資警報推送目標固定使用 `ADMIN_GROUP_ID`
+  - 若 `ride_timestamp` 距離現在不足 60 分鐘且 `is_fake=true` → 立即推送警報（不等待 timer）
+- **診斷日誌**：
+  - `[System] 目前 ADMIN_GROUP_ID 為: ...`
+  - `[AI] 原始解析結果: ...`
+  - `[Timer] 成功設定假資警報，目標時間: ...`
+
