@@ -213,6 +213,7 @@ async function handleEvent(event) {
     const text = event.message.text.trim();
     sourceType = event.source?.type;
 
+    console.log("收到訊息來源 ID:", event.source?.groupId || event.source?.userId);
     console.log("📩", sourceType, text);
 
     // =========================
