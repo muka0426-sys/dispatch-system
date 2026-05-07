@@ -511,7 +511,7 @@ export async function parseOrderFromText(messageText, options = {}) {
       0
     );
 
-    const genAI = new GoogleGenerativeAI(apiKey);
+    const genAI = new GoogleGenerativeAI(apiKey, { apiVersion: "v1" });
     const model = genAI.getGenerativeModel({ model: FIXED_MODEL_ID });
 
     const systemPrompt = buildSystemPrompt(draftJson, messageText);
