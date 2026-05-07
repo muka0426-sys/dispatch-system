@@ -647,8 +647,8 @@ async function handleEvent(event) {
         });
 
         if (aiTime?.ride_timestamp) {
-          active.rideTimestamp = aiTime.ride_timestamp;
-          active.rideTimestampMs = Date.parse(aiTime.ride_timestamp);
+          active.rideTimestamp = normalizeRideTimestampYearTo2026(aiTime.ride_timestamp);
+          active.rideTimestampMs = active.rideTimestamp ? Date.parse(active.rideTimestamp) : NaN;
           if (Number.isFinite(active.rideTimestampMs) && active.isFake && active.date) {
             scheduleFakeReservationAlert(active);
           }
@@ -805,6 +805,13 @@ function scheduleFakeReservationAlert(order) {
     let delay = fireAt - Date.now();
     if (!Number.isFinite(delay)) return;
 
+    console.log(
+      "[Alarm Check] 最終發車時間:",
+      order.rideTimestamp,
+      "目前系統時間:",
+      new Date().toISOString()
+    );
+
     // v0.3.6：不足 60 分鐘 → 立刻警報（不等待、不 return）
     if (delay <= 0) {
       if (Number(order.rideTimestampMs) > Date.now() && process.env.ADMIN_GROUP_ID && order.isFake) {
@@ -847,6 +854,13 @@ function scheduleFakeReservationAlert(order) {
   } catch (e) {
     console.error("[scheduleFakeReservationAlert]", e?.message || e);
   }
+}
+
+function normalizeRideTimestampYearTo2026(ts) {
+  const s = String(ts ?? "").trim();
+  if (!s) return null;
+  if (/^(2024|2025)-/.test(s)) return s.replace(/^(2024|2025)-/, "2026-");
+  return s;
 }
 
 function clearAlarm(orderId) {
@@ -937,6 +951,7 @@ function createOrderId() {
 
 function createOrder(customerId, form) {
   const orderId = createOrderId();
+  const normalizedRideTimestamp = normalizeRideTimestampYearTo2026(form.ride_timestamp);
   const newOrder = {
     orderId,
     status: "waiting",
@@ -952,8 +967,8 @@ function createOrder(customerId, form) {
     estimatedRouteFare: form.estimated_route_fare ?? null,
     estimatedRouteSource: form.estimated_route_source ?? null,
     isFake: Boolean(form.is_fake),
-    rideTimestamp: form.ride_timestamp || null,
-    rideTimestampMs: form.ride_timestamp ? Date.parse(form.ride_timestamp) : null,
+    rideTimestamp: normalizedRideTimestamp || null,
+    rideTimestampMs: normalizedRideTimestamp ? Date.parse(normalizedRideTimestamp) : null,
     fakeAlertTimer: null,
     createdAt: Date.now(),
     driverId: null,
