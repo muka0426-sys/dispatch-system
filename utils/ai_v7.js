@@ -673,7 +673,7 @@ export async function parseOrderFromText(messageText, options = {}) {
             pickup_verified,
             time_clear,
             is_fake,
-            ride_timestamp: ride_timestamp || null,
+            ride_timestamp: normalizeRideTimestampYearTo2026(ride_timestamp) || null,
             needs_admin_pricing,
             price: Number.isFinite(price) ? Math.round(price) : null,
             route_key,
