@@ -278,8 +278,8 @@ async function handleEvent(event) {
     // =========================
     // v0.3.6 審查修復：假資警報（任何來源，只要 AI 解析到 is_fake+ride_timestamp）
     if (aiResult?.is_fake && aiResult?.ride_timestamp && process.env.ADMIN_GROUP_ID) {
-      const rideTimestamp = aiResult.ride_timestamp;
-      const rideMs = Date.parse(rideTimestamp);
+      const rideTimestamp = normalizeRideTimestampYearTo2026(aiResult.ride_timestamp);
+      const rideMs = rideTimestamp ? Date.parse(rideTimestamp) : NaN;
       if (Number.isFinite(rideMs) && rideMs > Date.now()) {
         const remainingMs = rideMs - Date.now();
         const key = `${sourceType}_${event.source?.groupId || event.source?.userId}_${rideMs}`;

@@ -2,8 +2,7 @@ import { GoogleGenerativeAI } from "@google/generative-ai";
 import { readFile } from "node:fs/promises";
 
 const AI_RESOLVER_VERSION = "v7-map-first";
-let CACHED_MODEL_ID = null;
-let CACHED_MODEL_CANDIDATES = null;
+const FIXED_MODEL_ID = "gemini-1.5-flash";
 
 const REPLY_MAX_CHARS = 50;
 const REPLY_TARGET_MIN = 30;
@@ -163,6 +162,13 @@ function forcedCurrentYear() {
   return 2026;
 }
 
+function normalizeRideTimestampYearTo2026(ts) {
+  const s = String(ts ?? "").trim();
+  if (!s) return null;
+  if (/^(2024|2025)-/.test(s)) return s.replace(/^(2024|2025)-/, "2026-");
+  return s;
+}
+
 function parseRideTimestampString(raw) {
   const s = String(raw ?? "").trim();
   if (!s) return null;
@@ -170,7 +176,8 @@ function parseRideTimestampString(raw) {
   // ISO already
   if (/^\d{4}-\d{2}-\d{2}T/.test(s)) {
     const ms = Date.parse(s);
-    return Number.isFinite(ms) ? new Date(ms).toISOString() : null;
+    const iso = Number.isFinite(ms) ? new Date(ms).toISOString() : null;
+    return normalizeRideTimestampYearTo2026(iso);
   }
 
   // 21號凌晨12點 / 21號半夜1點
@@ -184,7 +191,7 @@ function parseRideTimestampString(raw) {
     const minute = cd[4] ? Number(cd[4]) : 0;
     const hour = hourRaw === 12 ? 0 : hourRaw; // 凌晨/半夜12點 = 00:00
     const dt = new Date(year, month - 1, day, hour, minute, 0, 0);
-    return Number.isFinite(dt.getTime()) ? dt.toISOString() : null;
+    return Number.isFinite(dt.getTime()) ? normalizeRideTimestampYearTo2026(dt.toISOString()) : null;
   }
 
   // 05/07 凌晨12點 / 5/7 半夜1點
@@ -199,7 +206,7 @@ function parseRideTimestampString(raw) {
     const minute = md[5] ? Number(md[5]) : 0;
     const hour = hourRaw === 12 ? 0 : hourRaw;
     const dt = new Date(year, month - 1, day, hour, minute, 0, 0);
-    return Number.isFinite(dt.getTime()) ? dt.toISOString() : null;
+    return Number.isFinite(dt.getTime()) ? normalizeRideTimestampYearTo2026(dt.toISOString()) : null;
   }
 
   // 今天/明天 HH:mm
@@ -219,7 +226,7 @@ function parseRideTimestampString(raw) {
     const hour = Number(rel[2]);
     const minute = rel[3] ? Number(rel[3]) : 0;
     const dt = new Date(year, month - 1, day, hour, minute, 0, 0);
-    return Number.isFinite(dt.getTime()) ? dt.toISOString() : null;
+    return Number.isFinite(dt.getTime()) ? normalizeRideTimestampYearTo2026(dt.toISOString()) : null;
   }
 
   // 今天/明天 凌晨/半夜 12點(30分)
@@ -235,7 +242,7 @@ function parseRideTimestampString(raw) {
     const minute = relNight[4] ? Number(relNight[4]) : 0;
     const hour = hourRaw === 12 ? 0 : hourRaw;
     const dt = new Date(base.getFullYear(), base.getMonth(), base.getDate(), hour, minute, 0, 0);
-    return Number.isFinite(dt.getTime()) ? dt.toISOString() : null;
+    return Number.isFinite(dt.getTime()) ? normalizeRideTimestampYearTo2026(dt.toISOString()) : null;
   }
 
   // 05/07 14:30 or 5/7 1430
@@ -247,7 +254,7 @@ function parseRideTimestampString(raw) {
     const hour = Number(m[3]);
     const minute = m[4] ? Number(m[4]) : 0;
     const dt = new Date(year, month - 1, day, hour, minute, 0, 0);
-    return Number.isFinite(dt.getTime()) ? dt.toISOString() : null;
+    return Number.isFinite(dt.getTime()) ? normalizeRideTimestampYearTo2026(dt.toISOString()) : null;
   }
 
   return null;
@@ -272,7 +279,7 @@ function parseRideTimestampFromDraft({ date, time }) {
 
   const dt = new Date(year, month - 1, day, hour, minute, 0, 0);
   if (!Number.isFinite(dt.getTime())) return null;
-  return dt.toISOString();
+  return normalizeRideTimestampYearTo2026(dt.toISOString());
 }
 
 function detectVehicleRequestType(messageText) {
@@ -323,12 +330,8 @@ function overloadSurchargeByPassengers(passengers, seatType) {
   const p = Number(passengers);
   if (!Number.isFinite(p) || p <= 0) return 0;
 
-  const seat = String(seatType ?? "").trim();
-  let baseCap = 4; // default 5座基準4人
-  if (seat === "6") baseCap = 5;
-  else if (seat === "7") baseCap = 6;
-  else if (seat === "8") baseCap = 6;
-  else if (seat === "9") baseCap = 6;
+  const seat = Number(String(seatType ?? "").trim());
+  const baseCap = Number.isFinite(seat) && seat >= 7 ? 6 : 4;
 
   if (p <= baseCap) return 0;
   return (p - baseCap) * 100;
@@ -447,41 +450,12 @@ async function estimateAirportFlatFareByKb({ pickup, messageText, dropoff }) {
     return null;
   }
 
-  return (
+  const match =
     findInGroup(table?.taipei_city) ??
     findInGroup(table?.new_taipei_city) ??
     findInGroup(table?.taoyuan_keelung) ??
-    null
-  );
-}
-
-async function getAvailableModel(apiKey) {
-  if (CACHED_MODEL_ID) return CACHED_MODEL_ID;
-  try {
-    const url = `https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`;
-    const response = await fetch(url);
-    const data = await response.json();
-
-    const models = Array.isArray(data?.models) ? data.models : [];
-    const supportsGenerate = (m) =>
-      Array.isArray(m?.supportedGenerationMethods) &&
-      m.supportedGenerationMethods.includes("generateContent");
-
-    const candidates = models
-      .filter(supportsGenerate)
-      .map((m) => String(m.name || ""))
-      .filter(Boolean)
-      .map((name) => name.replace(/^models\//, ""));
-
-    const flash = candidates.filter((id) => id.toLowerCase().includes("flash"));
-    CACHED_MODEL_CANDIDATES = [...flash, ...candidates.filter((id) => !flash.includes(id))];
-
-    CACHED_MODEL_ID = CACHED_MODEL_CANDIDATES[0] || "gemini-1.5-flash-latest";
-    console.log(`[AI] Auto-detected model: ${CACHED_MODEL_ID}`);
-    return CACHED_MODEL_ID;
-  } catch (e) {
-    return "gemini-1.5-flash-latest";
-  }
+    null;
+  return Number.isFinite(match) ? match : null;
 }
 
 function extractJsonObject(text) {
@@ -538,30 +512,17 @@ export async function parseOrderFromText(messageText, options = {}) {
     );
 
     const genAI = new GoogleGenerativeAI(apiKey);
-    const firstModelId = await getAvailableModel(apiKey);
-    const modelCandidates =
-      Array.isArray(CACHED_MODEL_CANDIDATES) && CACHED_MODEL_CANDIDATES.length
-        ? CACHED_MODEL_CANDIDATES
-        : [firstModelId];
+    const model = genAI.getGenerativeModel({ model: FIXED_MODEL_ID });
 
     const systemPrompt = buildSystemPrompt(draftJson, messageText);
 
     let lastErr = null;
-    for (let i = 0; i < Math.min(modelCandidates.length, 4); i++) {
-      const modelId = modelCandidates[i];
-      const model = genAI.getGenerativeModel({ model: modelId });
-
-      for (let attempt = 0; attempt < 3; attempt++) {
-        try {
-          const res = await model.generateContent(systemPrompt);
-          const raw = res?.response?.text?.() ?? "";
-          const obj = extractJsonObject(raw);
-          if (!obj || typeof obj !== "object") throw new Error("AI output invalid");
-
-          if (modelId && modelId !== CACHED_MODEL_ID) {
-            CACHED_MODEL_ID = modelId;
-            console.log(`[AI] Switched to working model: ${CACHED_MODEL_ID}`);
-          }
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const res = await model.generateContent(systemPrompt);
+        const raw = res?.response?.text?.() ?? "";
+        const obj = extractJsonObject(raw);
+        if (!obj || typeof obj !== "object") throw new Error("AI output invalid");
 
           const draft = {
             date: String(obj.draft?.date ?? "").trim(),
@@ -630,13 +591,27 @@ export async function parseOrderFromText(messageText, options = {}) {
           // ===== 預計車資口徑（派單欄位用） =====
           if (isAirportRideIntent(messageText) && Boolean(obj.ride_related)) {
             if (pickup_verified) {
-              const flat =
-                (await estimateAirportFlatFareByKb({
-                  pickup: draft.pickup,
-                  messageText,
-                  dropoff: draft.dropoff
-                })) ?? estimateAirportFlatFare(draft.pickup);
-              draft.estimated_fare_text = `機場定額 $${flat}`;
+              const kbFlat = await estimateAirportFlatFareByKb({
+                pickup: draft.pickup,
+                messageText,
+                dropoff: draft.dropoff
+              });
+              if (Number.isFinite(kbFlat)) {
+                draft.estimated_fare_text = `機場定額 $${kbFlat}`;
+              } else {
+                // 查無定額 → 改用最短里程估價（起步50+每公里20）
+                const est = await getGoogleShortestRouteEstimate({
+                  origin: draft.pickup,
+                  destination: draft.dropoff || messageText
+                });
+                if (est?.km) {
+                  const calc = Math.round(50 + 20 * Number(est.km));
+                  draft.estimated_fare_text = `最短${est.km}km 估$${calc}`;
+                } else {
+                  const flatFallback = estimateAirportFlatFare(draft.pickup);
+                  draft.estimated_fare_text = `機場定額 $${flatFallback}`;
+                }
+              }
             } else {
               draft.estimated_fare_text = "機場定額需看上車區域(請補行政區)";
             }
@@ -652,8 +627,9 @@ export async function parseOrderFromText(messageText, options = {}) {
 
           const ride_timestamp =
             (typeof obj.ride_timestamp === "string" && obj.ride_timestamp.includes("T"))
-              ? String(obj.ride_timestamp).trim()
-              : parseRideTimestampString(obj.ride_timestamp) || parseRideTimestampFromDraft(draft);
+              ? normalizeRideTimestampYearTo2026(String(obj.ride_timestamp).trim())
+              : normalizeRideTimestampYearTo2026(parseRideTimestampString(obj.ride_timestamp)) ||
+                normalizeRideTimestampYearTo2026(parseRideTimestampFromDraft(draft));
 
           const route_key = normalizeRouteKey(draft.pickup, draft.dropoff);
           let needs_admin_pricing = Boolean(obj.needs_admin_pricing);
@@ -665,8 +641,18 @@ export async function parseOrderFromText(messageText, options = {}) {
               needs_admin_pricing = false;
               price = kbHit.price;
             } else {
-              needs_admin_pricing = true;
-              price = null;
+              // 查無內建價目 → 改用 Google 最短里程估價（起步50+每公里20）
+              const est = await getGoogleShortestRouteEstimate({
+                origin: draft.pickup,
+                destination: draft.dropoff
+              });
+              if (est?.km) {
+                needs_admin_pricing = false;
+                price = Math.round(50 + 20 * Number(est.km));
+              } else {
+                needs_admin_pricing = true;
+                price = null;
+              }
             }
           }
 
@@ -694,26 +680,20 @@ export async function parseOrderFromText(messageText, options = {}) {
             draft,
             missing: Array.isArray(obj.missing) ? obj.missing.map((x) => String(x)) : []
           };
-        } catch (err) {
-          lastErr = err;
-          const status = err?.status;
-          if (status === 404) break;
-          if (status === 503 || status === 429) {
-            await sleep(250 * (attempt + 1));
-            continue;
-          }
-          break;
+      } catch (err) {
+        lastErr = err;
+        const status = err?.status;
+        if (status === 503 || status === 429) {
+          await sleep(250 * (attempt + 1));
+          continue;
         }
+        break;
       }
     }
 
     throw lastErr || new Error("AI failed");
   } catch (err) {
     console.error("[AI Error]", err?.message || err);
-    if (String(err?.message || "").includes("404") || err?.status === 404) {
-      CACHED_MODEL_ID = null;
-      CACHED_MODEL_CANDIDATES = null;
-    }
     return null;
   }
 }
@@ -891,7 +871,7 @@ export function rsCheckOvercharge({ km, fare }) {
  * 需要環境變數 GOOGLE_MAPS_API_KEY
  */
 export async function getGoogleShortestRouteEstimate({ origin, destination }) {
-  const key = String(process.env.GOOGLE_MAPS_API_KEY ?? "").trim();
+  const key = String(process.env.MAPS_API_KEY ?? process.env.GOOGLE_MAPS_API_KEY ?? "").trim();
   if (!key) return null;
   const o = String(origin ?? "").trim();
   const d = String(destination ?? "").trim();
