@@ -452,7 +452,7 @@ async function handleEvent(event) {
         waitingOrder.rs.bids.push(newBid);
         const leader = pickRsLeadingBid({ timing: waitingOrder.rs.timing, bids: waitingOrder.rs.bids });
 
-        // 同分強姦
+          // 同分強姦：同分後喊者可強姦取代；若已標記，僅「寶劍 1 分鐘內有效」
         if (
           canRsRapeTie({
             timing: waitingOrder.rs.timing,

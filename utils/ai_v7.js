@@ -281,9 +281,14 @@ function detectVehicleRequestType(messageText) {
 
   const hasSuv = /(休旅|SUV|休旅車)/i.test(t);
   const hasDoubleB = /(雙\s*B|BMW|賓士|Benz|Mercedes)/i.test(t);
+  const hasHighEnd = /(高級車|豪華車|高檔車)/.test(t);
+  const hasSpecified = /(指定|要.+車|要.+款|要.+型)/.test(t);
+
+  // 指定費：只要是指定車種而非隨機派發，一律 +100（不疊加）
   if (hasSuv && hasDoubleB) return "suv_double_b";
   if (hasSuv) return "suv";
   if (hasDoubleB) return "double_b";
+  if (hasHighEnd || hasSpecified) return "specified";
   return "";
 }
 
@@ -291,12 +296,42 @@ function vehicleTypeLabel(vehicle_request_type) {
   if (vehicle_request_type === "suv") return "休旅";
   if (vehicle_request_type === "double_b") return "雙B";
   if (vehicle_request_type === "suv_double_b") return "休旅/雙B";
+  if (vehicle_request_type === "specified") return "指定車種";
   return "";
 }
 
 function vehicleTypeSurcharge(vehicle_request_type) {
   if (!vehicle_request_type) return 0;
   return 100;
+}
+
+function parsePassengersHint(messageText, draftPassengers) {
+  const t = String(messageText ?? "");
+  const dp = String(draftPassengers ?? "").trim();
+  const m =
+    t.match(/(\d+)\s*人/) ||
+    t.match(/人數[:：]?\s*(\d+)/) ||
+    t.match(/共\s*(\d+)\s*人/);
+  const n1 = m ? Number(m[1]) : NaN;
+  if (Number.isFinite(n1) && n1 > 0) return Math.round(n1);
+  const n2 = Number(dp);
+  if (Number.isFinite(n2) && n2 > 0) return Math.round(n2);
+  return null;
+}
+
+function overloadSurchargeByPassengers(passengers, seatType) {
+  const p = Number(passengers);
+  if (!Number.isFinite(p) || p <= 0) return 0;
+
+  const seat = String(seatType ?? "").trim();
+  let baseCap = 4; // default 5座基準4人
+  if (seat === "6") baseCap = 5;
+  else if (seat === "7") baseCap = 6;
+  else if (seat === "8") baseCap = 6;
+  else if (seat === "9") baseCap = 6;
+
+  if (p <= baseCap) return 0;
+  return (p - baseCap) * 100;
 }
 
 function ensureSurchargeQuestionInReply(reply, vehicle_request_type) {
@@ -554,7 +589,7 @@ export async function parseOrderFromText(messageText, options = {}) {
           if (!pickup_verified) time_clear = false;
 
           // ===== 特殊需求（休旅/雙B） =====
-          const allowedVehicleTypes = new Set(["", "suv", "double_b", "suv_double_b"]);
+          const allowedVehicleTypes = new Set(["", "suv", "double_b", "suv_double_b", "specified"]);
           if (!allowedVehicleTypes.has(draft.vehicle_request_type)) {
             draft.vehicle_request_type = "";
           }
@@ -571,6 +606,11 @@ export async function parseOrderFromText(messageText, options = {}) {
           } else {
             draft.fare_surcharge = vehicleTypeSurcharge(draft.vehicle_request_type);
           }
+
+          // v0.5.0：加人費（超載準則）
+          // 5座：基準4人，第5人+100；6座：基準5人，第6人+100；7座以上：基準6人，第7人起每多1人+100
+          const passengersHint = parsePassengersHint(messageText, draft.passengers);
+          const overloadSurcharge = overloadSurchargeByPassengers(passengersHint, "");
 
           const rawScore = Number(obj.emotion_score);
           const emotion_score = Number.isFinite(rawScore)
@@ -629,6 +669,13 @@ export async function parseOrderFromText(messageText, options = {}) {
               price = null;
             }
           }
+
+          // v0.5.0：AI 在解析時必須把加價反映在 price 與 draft
+          const totalSurcharge = Math.max(0, (draft.fare_surcharge || 0) + (overloadSurcharge || 0));
+          if (Number.isFinite(price) && price != null) {
+            price = Math.round(Number(price) + totalSurcharge);
+          }
+          draft.estimated_fare_text = `${draft.estimated_fare_text}；加價+$${totalSurcharge}`;
 
           reply = ensureSurchargeQuestionInReply(reply, draft.vehicle_request_type);
           reply = ensureReplyLengthBand(reply);
