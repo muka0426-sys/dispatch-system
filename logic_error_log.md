@@ -267,3 +267,12 @@
   - 假資警報推播全面改用 `process.env.ADMIN_GROUP_ID`（避免常數/環境變數混用）
   - 增加解析與警報關鍵日誌（解析 input/result、alarm immediate/schedule）
 
+### v0.5.0 機場定額硬寫入 + 板規注入 + /遲到 指令
+- **時間**：2026-05-07 22:28 UTC+8
+- **版本/分支**：package.json@0.5.0
+- **模組/範圍**：knowledge_base.json、utils/ai_v7.js、server.js
+- **變更**：
+  - `knowledge_base.json` 新增 RS 神話價目表「桃機定額」完整表（台北/新北/桃園/基隆）
+  - `ai_v7.js` 機場定額改為優先讀 `knowledge_base.json.airport_flat_rates`，並在 `draft.estimated_fare_text` 追加等待費備註「等候5分後$5/分」
+  - `server.js` 新增管理群指令 `/遲到 分鐘 原車資`：10 分鐘內 8 折、10 分鐘以上 6 折（強姦遲到賠 3 成仍沿用既有邏輯）
+

@@ -50,7 +50,7 @@ const users = {};
 const handledEvents = new Set();
 
 const DRIVER_GROUP_ID = "C0227c4e4d8988002cfcd6527a43d3ad3";
-const ADMIN_GROUP_ID = (process.env.ADMIN_GROUP_ID || "").trim();
+const ADMIN_GROUP_ID = (process.env.ADMIN_GROUP_ID || "").trim(); // keep for logs; pushes must use process.env.ADMIN_GROUP_ID
 
 const KB_FILE = "knowledge_base.json";
 let knowledgeBase = { routes: {} };
@@ -358,6 +358,26 @@ async function handleEvent(event) {
           await replyOnceToCustomer(
             req.customerId,
             `收到，這趟先估$${Math.round(amount)}左右，可以嗎？要的話回我時間。`
+          );
+          return;
+        }
+
+        // v0.5.0：/遲到 指令（折扣規則）
+        // 格式：/遲到 {分鐘} {原車資}
+        if (text.startsWith("/遲到")) {
+          const m = text.match(/^\/遲到\s+(\d+)\s+(\d+)\s*$/);
+          const lateMin = m ? Number(m[1]) : NaN;
+          const fare = m ? Number(m[2]) : NaN;
+          if (!Number.isFinite(lateMin) || lateMin < 0 || !Number.isFinite(fare) || fare <= 0) {
+            await reply(replyToken, "格式錯誤，請回覆：/遲到 分鐘 原車資（例如 /遲到 8 300）");
+            return;
+          }
+
+          const ratio = lateMin <= 10 ? 0.8 : 0.6;
+          const discounted = Math.round(fare * ratio);
+          await reply(
+            replyToken,
+            `遲到補償：${lateMin}分 → ${Math.round(ratio * 100)}折，原$${fare} → $${discounted}`
           );
           return;
         }

@@ -126,10 +126,13 @@ async function loadKnowledgeBase() {
     const raw = await readFile(KB_FILE, "utf8");
     const obj = JSON.parse(raw);
     const routes = obj?.routes && typeof obj.routes === "object" ? obj.routes : {};
-    KB_CACHE = { routes };
+    const airport_flat_rates = obj?.airport_flat_rates && typeof obj.airport_flat_rates === "object"
+      ? obj.airport_flat_rates
+      : null;
+    KB_CACHE = { routes, airport_flat_rates };
     return KB_CACHE;
   } catch {
-    KB_CACHE = { routes: {} };
+    KB_CACHE = { routes: {}, airport_flat_rates: null };
     return KB_CACHE;
   }
 }
@@ -340,11 +343,81 @@ function isAirportRideIntent(messageText) {
 }
 
 function estimateAirportFlatFare(pickup) {
+  // Back-compat fallback: keep previous behavior if KB missing
   const p = String(pickup ?? "");
   if (/汐止/.test(p)) return 1200;
   if (/林口/.test(p)) return 700;
   if (/台北市/.test(p)) return 1000;
   return 1000;
+}
+
+function isTaoyuanAirportMentioned(text) {
+  const t = String(text ?? "");
+  return /(桃機|桃園機場|機場)/.test(t);
+}
+
+function normalizeDistrictHint(text) {
+  const t = String(text ?? "");
+  const candidates = [
+    "信義",
+    "大安",
+    "松山",
+    "中正",
+    "中山",
+    "大同",
+    "北投",
+    "萬華",
+    "南港",
+    "內湖",
+    "文山",
+    "板橋",
+    "三重",
+    "蘆洲",
+    "土城",
+    "中和",
+    "永和",
+    "新店",
+    "淡水",
+    "汐止",
+    "林口",
+    "桃園區",
+    "蘆竹",
+    "基隆七堵"
+  ];
+  for (const c of candidates) {
+    if (t.includes(c)) return c;
+    if (t.includes(`${c}區`)) return c;
+  }
+  return "";
+}
+
+async function estimateAirportFlatFareByKb({ pickup, messageText, dropoff }) {
+  // Use knowledge_base.json airport_flat_rates if available.
+  // Only applies when intent is airport ride and destination mentions airport.
+  if (!isTaoyuanAirportMentioned(dropoff || messageText)) return null;
+
+  const district = normalizeDistrictHint(pickup) || normalizeDistrictHint(messageText);
+  if (!district) return null;
+
+  const kb = await loadKnowledgeBase();
+  const table = kb?.airport_flat_rates?.to_taoyuan_airport;
+  if (!table) return null;
+
+  function findInGroup(group) {
+    if (!group || typeof group !== "object") return null;
+    for (const [priceStr, arr] of Object.entries(group)) {
+      if (!Array.isArray(arr)) continue;
+      if (arr.some((x) => String(x) === district)) return Number(priceStr);
+    }
+    return null;
+  }
+
+  return (
+    findInGroup(table?.taipei_city) ??
+    findInGroup(table?.new_taipei_city) ??
+    findInGroup(table?.taoyuan_keelung) ??
+    null
+  );
 }
 
 async function getAvailableModel(apiKey) {
@@ -517,7 +590,12 @@ export async function parseOrderFromText(messageText, options = {}) {
           // ===== 預計車資口徑（派單欄位用） =====
           if (isAirportRideIntent(messageText) && Boolean(obj.ride_related)) {
             if (pickup_verified) {
-              const flat = estimateAirportFlatFare(draft.pickup);
+              const flat =
+                (await estimateAirportFlatFareByKb({
+                  pickup: draft.pickup,
+                  messageText,
+                  dropoff: draft.dropoff
+                })) ?? estimateAirportFlatFare(draft.pickup);
               draft.estimated_fare_text = `機場定額 $${flat}`;
             } else {
               draft.estimated_fare_text = "機場定額需看上車區域(請補行政區)";
@@ -525,6 +603,9 @@ export async function parseOrderFromText(messageText, options = {}) {
           } else if (Boolean(obj.ride_related)) {
             draft.estimated_fare_text = "起步$50＋$20/公里（4公里內低消$130）";
           }
+
+          // v0.5.0：等待費備註（AI 報價 draft 需備註）
+          draft.estimated_fare_text = `${draft.estimated_fare_text}；等候5分後$5/分`;
 
           // ===== v0.3.0：假資偵測 + ride_timestamp + 未建檔報價攔截 =====
           const is_fake = looksLikeFakeDriverNote(messageText) || Boolean(obj.is_fake);
