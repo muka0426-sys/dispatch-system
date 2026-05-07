@@ -2,7 +2,7 @@ import { GoogleGenerativeAI } from "@google/generative-ai";
 import { readFile } from "node:fs/promises";
 
 const AI_RESOLVER_VERSION = "v7-map-first";
-const FIXED_MODEL_ID = "gemini-1.5-flash";
+const FIXED_MODEL_ID = "models/gemini-1.5-flash";
 
 const REPLY_MAX_CHARS = 50;
 const REPLY_TARGET_MIN = 30;
@@ -512,7 +512,7 @@ export async function parseOrderFromText(messageText, options = {}) {
     );
 
     const genAI = new GoogleGenerativeAI(apiKey, { apiVersion: "v1" });
-    const model = genAI.getGenerativeModel({ model: FIXED_MODEL_ID });
+    const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" }, { apiVersion: "v1" });
 
     const systemPrompt = buildSystemPrompt(draftJson, messageText);
 
