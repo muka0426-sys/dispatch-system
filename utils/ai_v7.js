@@ -36,7 +36,7 @@ function ensureReplyLengthBand(text) {
 /**
  * 依 .cursorrules：地圖優先、30～50 字、台灣派遣口語、EmotionScore、禁冗稱與誤導派車語。
  */
-function buildSystemPrompt(draftJson, messageText) {
+function buildSystemPrompt(draftJson, messageText, kbFareHint = "") {
   return `
 你是台灣派遣「排車調度」，口語像現場調度：簡短、清楚、不機械。禁用「親愛的顧客」等冗稱。
 
@@ -61,6 +61,10 @@ function buildSystemPrompt(draftJson, messageText) {
 - 嚴禁只看到「機場」關鍵字就當成機場接送，必須先判斷為「交通請求/叫車意圖」才可套用機場定額。
 - 機場定額（示例）：台北市多數區域 $1000、汐止 $1200、林口 $700。若區域不明，先追問區域再報價。
 - 一般叫車里程計費：起步 $50，每公里 $20，4 公里內低消 $130（不知道公里數時就用這句說明，不要亂算總額）。
+
+【知識庫定額（最高準則）】
+- 下列內容來自 knowledge_base.json；若非空，代表已定額。**嚴禁**在 reply 或 price 自創與下列牴觸的金額。
+${kbFareHint ? kbFareHint : "（本則尚未由系統預先命中 KB 定額；仍須遵守後續欄位與口徑。）"}
 
 【等待費與特殊加價（強制）】
 - 等待費：司機抵達後緩衝 5 分鐘，超過後每分鐘 5 元。客人問起時 reply 必須包含：「1分鐘都是5元喲🥰」。
@@ -123,6 +127,11 @@ function normalizeRouteKey(pickup, dropoff) {
   return `${String(pickup ?? "").trim()} → ${String(dropoff ?? "").trim()}`;
 }
 
+/** 每次解析前可清掉快取，強制重新讀取 knowledge_base.json（定額以檔案為準）。 */
+export function invalidateKnowledgeBaseCache() {
+  KB_CACHE = null;
+}
+
 let KB_CACHE = null;
 async function loadKnowledgeBase() {
   if (KB_CACHE) return KB_CACHE;
@@ -149,6 +158,68 @@ async function lookupKnowledgePrice(pickup, dropoff) {
   const price = typeof v === "number" ? v : Number(v?.price);
   if (!Number.isFinite(price) || price <= 0) return null;
   return { route_key: key, price: Math.round(price) };
+}
+
+/**
+ * 呼叫模型前：依草稿＋本則文字預讀 KB，寫入 prompt（嚴禁 AI 自創與 KB 牴觸的價格）。
+ */
+export async function buildKbFareHintForPrompt(messageText, prevDraft) {
+  await loadKnowledgeBase();
+  const pickup = String(prevDraft?.pickup ?? "").trim();
+  const dropoff = String(prevDraft?.dropoff ?? "").trim();
+  const msg = String(messageText ?? "");
+  const pickupHint = pickup || msg;
+  const dropHint = dropoff || msg;
+  const lines = [];
+
+  if (pickupHint && isAirportRideIntent(msg) && isTaoyuanAirportMentioned(dropHint)) {
+    const af = await estimateAirportFlatFareByKb({
+      pickup: pickupHint,
+      messageText: msg,
+      dropoff: dropHint
+    });
+    if (Number.isFinite(af)) {
+      lines.push(`- 機場定額（知識庫）：基礎 $${af}（加價／人數另計，由 estimated_fare_text 呈現）。reply 嚴禁寫成其他金額。`);
+    }
+  }
+
+  if (pickup && dropoff) {
+    const hit = await lookupKnowledgePrice(pickup, dropoff);
+    if (hit) {
+      lines.push(`- 內建路線（知識庫）「${hit.route_key}」：$${hit.price}。reply 報價須與此一致。`);
+    }
+  }
+
+  return lines.join("\n");
+}
+
+/** 從已定稿的 estimated_fare_text 抽出「定額基礎＋加價」合計，供與對話對齊。 */
+export function parseKbCanonicalFareTotal(estimatedFareText) {
+  const s = String(estimatedFareText ?? "");
+  let base = null;
+  const mA = s.match(/機場定額 \$(\d+)/);
+  const mR = s.match(/內建路線定額 \$(\d+)/);
+  if (mA) base = Number(mA[1]);
+  else if (mR) base = Number(mR[1]);
+  if (base == null || !Number.isFinite(base)) return null;
+  const mS = s.match(/加價\+\$(\d+)/);
+  const sur = mS && Number.isFinite(Number(mS[1])) ? Number(mS[1]) : 0;
+  return Math.round(base + sur);
+}
+
+export function alignCustomerReplyToEstimatedFare(reply, estimatedFareText) {
+  const total = parseKbCanonicalFareTotal(estimatedFareText);
+  if (total == null) return String(reply ?? "").trim();
+  let t = String(reply ?? "")
+    .replace(/\$\d+/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  const tail = `參考$${total}（同派車卡）。`;
+  return `${t} ${tail}`.trim();
+}
+
+export function finalizeCustomerFareReply(reply, estimatedFareText) {
+  return ensureReplyLengthBand(alignCustomerReplyToEstimatedFare(reply, estimatedFareText));
 }
 
 function looksLikeFakeDriverNote(messageText) {
@@ -598,6 +669,7 @@ export async function parseOrderFromText(messageText, options = {}) {
       return null;
     }
 
+    invalidateKnowledgeBaseCache();
     const prevDraft = options.draft || {};
     const vehicle_request_type_hint = detectVehicleRequestType(messageText);
     const draftJson = JSON.stringify(
@@ -615,7 +687,8 @@ export async function parseOrderFromText(messageText, options = {}) {
       0
     );
 
-    const systemPrompt = buildSystemPrompt(draftJson, messageText);
+    const kbFareHint = await buildKbFareHintForPrompt(messageText, prevDraft);
+    const systemPrompt = buildSystemPrompt(draftJson, messageText, kbFareHint);
 
     let lastErr = null;
     for (let attempt = 0; attempt < 3; attempt++) {
@@ -687,6 +760,8 @@ export async function parseOrderFromText(messageText, options = {}) {
             reply = `請問是哪一個區的${road}呢？為了避免司機跑錯，再麻煩提供一下喔！🥰`;
           }
 
+          let airportKbFlatResolved = null;
+
           // ===== 預計車資口徑（派單欄位用） =====
           if (isAirportRideIntent(messageText) && Boolean(obj.ride_related)) {
             if (pickup_verified) {
@@ -696,6 +771,7 @@ export async function parseOrderFromText(messageText, options = {}) {
                 dropoff: draft.dropoff
               });
               if (Number.isFinite(kbFlat)) {
+                airportKbFlatResolved = kbFlat;
                 draft.estimated_fare_text = `機場定額 $${kbFlat}`;
               } else {
                 // 查無定額 → 改用最短里程估價（起步50+每公里20）
@@ -715,7 +791,15 @@ export async function parseOrderFromText(messageText, options = {}) {
               draft.estimated_fare_text = "機場定額需看上車區域(請補行政區)";
             }
           } else if (Boolean(obj.ride_related)) {
-            draft.estimated_fare_text = "起步$50＋$20/公里（4公里內低消$130）";
+            const routeHit =
+              pickup_verified && String(draft.dropoff ?? "").trim()
+                ? await lookupKnowledgePrice(draft.pickup, draft.dropoff)
+                : null;
+            if (routeHit) {
+              draft.estimated_fare_text = `內建路線定額 $${routeHit.price}`;
+            } else {
+              draft.estimated_fare_text = "起步$50＋$20/公里（4公里內低消$130）";
+            }
           }
 
           // v0.5.0：等待費備註（AI 報價 draft 需備註）
@@ -757,13 +841,16 @@ export async function parseOrderFromText(messageText, options = {}) {
 
           // v0.5.0：AI 在解析時必須把加價反映在 price 與 draft
           const totalSurcharge = Math.max(0, (draft.fare_surcharge || 0) + (overloadSurcharge || 0));
-          if (Number.isFinite(price) && price != null) {
+          if (Number.isFinite(airportKbFlatResolved) && pickup_verified) {
+            price = Math.round(airportKbFlatResolved + totalSurcharge);
+            needs_admin_pricing = false;
+          } else if (Number.isFinite(price) && price != null) {
             price = Math.round(Number(price) + totalSurcharge);
           }
           draft.estimated_fare_text = `${draft.estimated_fare_text}；加價+$${totalSurcharge}`;
 
           reply = ensureSurchargeQuestionInReply(reply, draft.vehicle_request_type);
-          reply = ensureReplyLengthBand(reply);
+          reply = finalizeCustomerFareReply(reply, draft.estimated_fare_text);
 
           return {
             ride_related: Boolean(obj.ride_related),

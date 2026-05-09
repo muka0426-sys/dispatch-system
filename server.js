@@ -14,7 +14,8 @@ import {
   canRsRapeTie,
   rsCheckOvercharge,
   getGoogleShortestRouteEstimate,
-  estimateAirportFlatFareByKb
+  estimateAirportFlatFareByKb,
+  finalizeCustomerFareReply
 } from "./utils/ai_v7.js";
 
 console.log("[boot] server.js", {
@@ -58,7 +59,7 @@ let knowledgeBase = { routes: {} };
 const pendingAdminPricing = []; // FIFO: { route_key, pickup, dropoff, customerId, baselineKm, baselineFare, confirmAmount }
 
 const ALARMS_DB_FILE = "alarms_db.json";
-let alarmsDb = { alarms: {} };
+let alarmsDb = { alarms: {}, waiting_dispatches: {} };
 
 // v0.3.5：Railway 啟動防呆（同步建立缺失 JSON 檔）
 function ensureJsonFileSync(path, defaultText = "{}") {
@@ -117,20 +118,57 @@ async function loadAlarmsDb() {
     await ensureJsonFile(ALARMS_DB_FILE);
     const raw = await readFile(ALARMS_DB_FILE, "utf8");
     const obj = JSON.parse(raw);
-    alarmsDb = { alarms: obj?.alarms && typeof obj.alarms === "object" ? obj.alarms : {} };
+    alarmsDb = {
+      alarms: obj?.alarms && typeof obj.alarms === "object" ? obj.alarms : {},
+      waiting_dispatches:
+        obj?.waiting_dispatches && typeof obj.waiting_dispatches === "object"
+          ? obj.waiting_dispatches
+          : {}
+    };
   } catch {
-    alarmsDb = { alarms: {} };
+    alarmsDb = { alarms: {}, waiting_dispatches: {} };
   }
 }
 
 async function saveAlarmsDb() {
-  const out = { version: "0.3.3", alarms: alarmsDb.alarms || {} };
+  const out = {
+    version: "0.7.3",
+    alarms: alarmsDb.alarms || {},
+    waiting_dispatches: alarmsDb.waiting_dispatches || {}
+  };
   await writeFile(ALARMS_DB_FILE, JSON.stringify(out, null, 2), "utf8");
 }
 
 async function upsertAlarmRecord(record) {
+  alarmsDb.alarms = alarmsDb.alarms || {};
   alarmsDb.alarms[record.key] = record;
   await saveAlarmsDb();
+}
+
+/** 派單廣播前強制持久化；失敗則不可對司機群發送格式。 */
+async function persistDispatchSnapshot(order, merged, finalBlock) {
+  await loadAlarmsDb();
+  alarmsDb.waiting_dispatches = alarmsDb.waiting_dispatches || {};
+  alarmsDb.waiting_dispatches[order.orderId] = {
+    orderId: order.orderId,
+    customerId: order.customerId,
+    pickup: String(order.pickup ?? ""),
+    dropoff: String(order.dropoff ?? ""),
+    date: order.date ?? null,
+    time: String(order.time ?? ""),
+    estimated_fare_text: String(merged.estimated_fare_text ?? ""),
+    finalBlock,
+    createdAtMs: order.createdAt,
+    persistedAtMs: Date.now()
+  };
+  await saveAlarmsDb();
+}
+
+function removeOrderById(orderId) {
+  const key = String(orderId ?? "");
+  if (!key) return;
+  const idx = orders.findIndex((o) => o.orderId === key);
+  if (idx >= 0) orders.splice(idx, 1);
 }
 
 async function deleteAlarmRecord(key) {
@@ -391,7 +429,10 @@ async function handleEvent(event) {
       }
       if (orders.length === 0) return;
 
-      const waitingOrder = getNextWaitingOrder();
+      const dispatcherMark = parseRsDispatcherMark(text);
+      const waitingOrder = getWaitingOrderForDriverMessage(text, {
+        isDispatcherMark: Boolean(dispatcherMark)
+      });
       if (!waitingOrder) return;
 
       waitingOrder.rs = waitingOrder.rs || {
@@ -404,8 +445,7 @@ async function handleEvent(event) {
       };
 
       // ===== 派單員標記（@）→ 立刻自動噴車卡 =====
-      const mark = parseRsDispatcherMark(text);
-      if (mark) {
+      if (dispatcherMark) {
         waitingOrder.rs.dispatcherMarkedAtMs = Date.now();
         const leader = pickRsLeadingBid({ timing: waitingOrder.rs.timing, bids: waitingOrder.rs.bids });
         if (!leader) {
@@ -671,7 +711,7 @@ async function handleEvent(event) {
           active.rideTimestamp = normalizeRideTimestampYearTo2026(aiTime.ride_timestamp);
           active.rideTimestampMs = active.rideTimestamp ? Date.parse(active.rideTimestamp) : NaN;
           if (Number.isFinite(active.rideTimestampMs) && active.isFake && active.date) {
-            scheduleFakeReservationAlert(active);
+            await scheduleFakeReservationAlert(active);
           }
           await reply(replyToken, "收到，時間已更新。");
           return;
@@ -765,21 +805,33 @@ async function handleEvent(event) {
         }
 
         const finalBlock = buildAcceleratedDispatchFormat(merged);
-        const safeLead = stripDispatchMisleadingPhrases(ai.reply);
+        const safeLead = finalizeCustomerFareReply(
+          stripDispatchMisleadingPhrases(ai.reply),
+          merged.estimated_fare_text
+        );
         const customerMsg = [safeLead, finalBlock].filter(Boolean).join("\n\n");
-        await reply(replyToken, customerMsg);
 
         const form = draftToRideForm(merged, finalBlock);
         const order = createOrder(userId, form);
 
+        try {
+          await persistDispatchSnapshot(order, merged, finalBlock);
+        } catch (e) {
+          console.error("[persistDispatchSnapshot]", e?.message || e);
+          removeOrderById(order.orderId);
+          await reply(replyToken, "系統存檔失敗，派單未完成，請稍後再試。");
+          return;
+        }
+
         // v0.3.0：假資預約單倒數警報（is_fake + ride_timestamp）
         if (order.isFake && order.rideTimestampMs && process.env.ADMIN_GROUP_ID) {
-          scheduleFakeReservationAlert(order);
+          await scheduleFakeReservationAlert(order);
         }
 
         clearDispatchDraft(userId);
         setUserState(userId, "waiting_dispatch", { orderId: order.orderId });
 
+        await reply(replyToken, customerMsg);
         await pushText(DRIVER_GROUP_ID, finalBlock);
         return;
       }
@@ -837,7 +889,7 @@ async function handleEvent(event) {
   }
 }
 
-function scheduleFakeReservationAlert(order) {
+async function scheduleFakeReservationAlert(order) {
   try {
     if (!order?.rideTimestampMs) return;
     clearAlarm(order.orderId);
@@ -879,15 +931,19 @@ function scheduleFakeReservationAlert(order) {
         }
       }, delay);
       activeAlarms.set(order.orderId, order.fakeAlertTimer);
-      upsertAlarmRecord({
-        key: String(order.orderId),
-        orderId: String(order.orderId),
-        customerId: String(order.customerId),
-        pickup: String(order.pickup ?? ""),
-        dropoff: String(order.dropoff ?? ""),
-        rideTimestampMs: Number(order.rideTimestampMs),
-        createdAtMs: Date.now()
-      }).catch((e) => console.error("[upsertAlarmRecord]", e?.message || e));
+      try {
+        await upsertAlarmRecord({
+          key: String(order.orderId),
+          orderId: String(order.orderId),
+          customerId: String(order.customerId),
+          pickup: String(order.pickup ?? ""),
+          dropoff: String(order.dropoff ?? ""),
+          rideTimestampMs: Number(order.rideTimestampMs),
+          createdAtMs: Date.now()
+        });
+      } catch (e) {
+        console.error("[upsertAlarmRecord]", e?.message || e);
+      }
 
       console.log("[Timer] 成功設定假資警報，目標時間:", order.rideTimestamp);
     }
@@ -1029,14 +1085,55 @@ function getActiveOrder(customerId) {
   return null;
 }
 
-/**
- * 取「目前待喊單／待標記」的訂單。必須是最新一筆 waiting，否則司機喊單會寫進舊單，
- * @ 標記時讀到的 bids 為空 →「沒有有效喊單」。（activeAlarms 僅假資倒數，與喊單無關。）
- */
-function getNextWaitingOrder() {
+/** 取 createdAt 最新的一筆 waiting（@ 標記、純分鐘喊單用）。 */
+function getLatestWaitingOrder() {
   const waiting = orders.filter((order) => order.status === "waiting");
   if (!waiting.length) return null;
   return waiting.reduce((a, b) => (a.createdAt >= b.createdAt ? a : b));
+}
+
+const DRIVER_BID_STOP_TOKENS = new Set([
+  "派單員",
+  "標記",
+  "分鐘",
+  "抵達",
+  "出發",
+  "目前",
+  "領先",
+  "收到",
+  "司機",
+  "有效",
+  "喊單"
+]);
+
+function extractLocationTokensForBidMatch(text) {
+  const t = String(text ?? "").trim();
+  if (!t) return [];
+  if (/^\d{1,3}\s*$/.test(t) || /^準\s*$/.test(t)) return [];
+  const chunks = t.match(/[\u4e00-\u9fff]{2,}/g) || [];
+  return chunks.filter((c) => !DRIVER_BID_STOP_TOKENS.has(c));
+}
+
+function orderMatchesLocationTokens(order, tokens) {
+  if (!tokens.length) return true;
+  const hay = `${order.pickup || ""}${order.dropoff || ""}${order.address || ""}`;
+  return tokens.some((tok) => hay.includes(tok));
+}
+
+/**
+ * 司機群：@ 標記 → 永遠綁最新 waiting；喊單 → 優先比對訊息中的地名與訂單上／下車址（如：南港 ⊆ 台北市南港區）。
+ */
+function getWaitingOrderForDriverMessage(text, { isDispatcherMark }) {
+  if (isDispatcherMark) return getLatestWaitingOrder();
+  const waiting = orders
+    .filter((order) => order.status === "waiting")
+    .sort((a, b) => b.createdAt - a.createdAt);
+  if (!waiting.length) return null;
+  if (waiting.length === 1) return waiting[0];
+  const tokens = extractLocationTokensForBidMatch(text);
+  const matched = waiting.filter((o) => orderMatchesLocationTokens(o, tokens));
+  if (matched.length) return matched[0];
+  return waiting[0];
 }
 
 function getWaitingOrderByPendingDriver(driverUserId) {
