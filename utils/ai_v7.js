@@ -357,7 +357,8 @@ function ensureSurchargeQuestionInReply(reply, vehicle_request_type) {
 function hasAdminDistrict(text) {
   const t = String(text ?? "").trim();
   if (!t) return false;
-  return /[^\s]{1,8}(區|鄉|鎮)\b/.test(t);
+  // 勿用 \\b：中文「板橋區文化路」中「區」後接漢字時 \\b 不成立，會誤判成無行政區。
+  return /[^\s，,]{1,12}(區|鄉|鎮)/.test(t);
 }
 
 function extractRoadName(text) {
@@ -369,6 +370,8 @@ function extractRoadName(text) {
 function isOnlyRoadWithoutDistrict(pickup) {
   const t = String(pickup ?? "").trim();
   if (!t) return false;
+  // 已有區／鄉／鎮／市：視為帶行政或縣市語境，不當成「只有路名」。
+  if (/(區|鄉|鎮|市)/.test(t)) return false;
   const hasRoad = /(路|街|大道|巷|弄)/.test(t);
   if (!hasRoad) return false;
   return !hasAdminDistrict(t);
@@ -634,7 +637,9 @@ export async function parseOrderFromText(messageText, options = {}) {
             "收到，請補縣市區、路名門牌，再加希望時間，謝謝。";
 
           // 若只有路名（無行政區），強制使用固定追問句（司機保護，禁止通靈）
-          if (isOnlyRoadWithoutDistrict(draft.pickup)) {
+          // 若 pickup 已含區／鄉／鎮／市，不可覆寫 AI 原 reply（避免復讀錯誤追問）。
+          const pickupHasAdminMarker = /(區|鄉|鎮|市)/.test(String(draft.pickup ?? ""));
+          if (isOnlyRoadWithoutDistrict(draft.pickup) && !pickupHasAdminMarker) {
             const road = extractRoadName(draft.pickup) || extractRoadName(messageText) || "這條路";
             reply = `請問是哪一個區的${road}呢？為了避免司機跑錯，再麻煩提供一下喔！🥰`;
           }
