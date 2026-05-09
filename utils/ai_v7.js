@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 
 const AI_RESOLVER_VERSION = "v7-map-first";
 const FIXED_MODEL_ID = "gemini-1.5-flash";
+const FALLBACK_MODEL_ID = "gemini-flash-latest";
 
 const REPLY_MAX_CHARS = 50;
 const REPLY_TARGET_MIN = 30;
@@ -511,15 +512,28 @@ export async function parseOrderFromText(messageText, options = {}) {
       0
     );
 
-    const genAI = new GoogleGenerativeAI(apiKey, { apiVersion: "v1beta" });
-    const model = genAI.getGenerativeModel({ model: FIXED_MODEL_ID }, { apiVersion: "v1beta" });
+    // 2026 現況：部分專案/區域對 gemini-1.5-* 會在 v1beta 直接 404。
+    // 這裡以 v1 為主路徑；若固定模型不可用，則自動 fallback，避免整個派單解析失效。
+    const genAI = new GoogleGenerativeAI(apiKey, { apiVersion: "v1" });
+    const primaryModel = genAI.getGenerativeModel({ model: FIXED_MODEL_ID }, { apiVersion: "v1" });
+    const fallbackModel = genAI.getGenerativeModel({ model: FALLBACK_MODEL_ID }, { apiVersion: "v1" });
 
     const systemPrompt = buildSystemPrompt(draftJson, messageText);
 
     let lastErr = null;
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
-        const res = await model.generateContent(systemPrompt);
+        let res;
+        try {
+          res = await primaryModel.generateContent(systemPrompt);
+        } catch (err) {
+          const msg = String(err?.message ?? "");
+          if (msg.includes("404") || msg.includes("not found") || msg.includes("ListModels")) {
+            res = await fallbackModel.generateContent(systemPrompt);
+          } else {
+            throw err;
+          }
+        }
         const raw = res?.response?.text?.() ?? "";
         const obj = extractJsonObject(raw);
         if (!obj || typeof obj !== "object") throw new Error("AI output invalid");
