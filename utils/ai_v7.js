@@ -3,7 +3,6 @@ import { readFile } from "node:fs/promises";
 
 const AI_RESOLVER_VERSION = "v7-map-first";
 const FIXED_MODEL_ID = "gemini-1.5-flash";
-const FALLBACK_MODEL_ID = "gemini-flash-latest";
 
 const REPLY_MAX_CHARS = 50;
 const REPLY_TARGET_MIN = 30;
@@ -474,6 +473,60 @@ function extractJsonObject(text) {
   }
 }
 
+function dedupeModelIds(ids) {
+  const out = [];
+  const seen = new Set();
+  for (const id of ids) {
+    const m = String(id ?? "").trim();
+    if (!m || seen.has(m)) continue;
+    seen.add(m);
+    out.push(m);
+  }
+  return out;
+}
+
+function isGeminiModelNotFoundError(err) {
+  const status = err?.status ?? err?.cause?.status;
+  if (status === 404) return true;
+  const msg = String(err?.message ?? err ?? "");
+  return /\b404\b|not found|ListModels/i.test(msg);
+}
+
+/**
+ * 依序嘗試 apiVersion（v1 → v1beta）與多個模型 ID；避免單一模型在專案/區域下架造成整條解析 404。
+ * 可設 GEMINI_MODEL 覆寫為鏈上第一順位。
+ */
+async function generateContentWithGeminiFallback(apiKey, prompt) {
+  const envOverride = (process.env.GEMINI_MODEL || "").trim();
+  const modelIds = dedupeModelIds([
+    envOverride,
+    FIXED_MODEL_ID,
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-2.0-flash"
+  ]);
+  const apiVersions = ["v1", "v1beta"];
+
+  let lastErr = null;
+  for (const apiVersion of apiVersions) {
+    const genAI = new GoogleGenerativeAI(apiKey, { apiVersion });
+    for (const modelId of modelIds) {
+      try {
+        const model = genAI.getGenerativeModel({ model: modelId }, { apiVersion });
+        const res = await model.generateContent(prompt);
+        if (modelId !== FIXED_MODEL_ID) {
+          console.warn("[AI] Gemini model fallback:", { apiVersion, modelId });
+        }
+        return res;
+      } catch (err) {
+        lastErr = err;
+        if (!isGeminiModelNotFoundError(err)) throw err;
+      }
+    }
+  }
+  throw lastErr ?? new Error("Gemini: no working model for this API key");
+}
+
 /**
  * @param {string} messageText
  * @param {{ draft?: Record<string,string> }} [options]
@@ -512,28 +565,12 @@ export async function parseOrderFromText(messageText, options = {}) {
       0
     );
 
-    // 2026 現況：部分專案/區域對 gemini-1.5-* 會在 v1beta 直接 404。
-    // 這裡以 v1 為主路徑；若固定模型不可用，則自動 fallback，避免整個派單解析失效。
-    const genAI = new GoogleGenerativeAI(apiKey, { apiVersion: "v1" });
-    const primaryModel = genAI.getGenerativeModel({ model: FIXED_MODEL_ID }, { apiVersion: "v1" });
-    const fallbackModel = genAI.getGenerativeModel({ model: FALLBACK_MODEL_ID }, { apiVersion: "v1" });
-
     const systemPrompt = buildSystemPrompt(draftJson, messageText);
 
     let lastErr = null;
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
-        let res;
-        try {
-          res = await primaryModel.generateContent(systemPrompt);
-        } catch (err) {
-          const msg = String(err?.message ?? "");
-          if (msg.includes("404") || msg.includes("not found") || msg.includes("ListModels")) {
-            res = await fallbackModel.generateContent(systemPrompt);
-          } else {
-            throw err;
-          }
-        }
+        const res = await generateContentWithGeminiFallback(apiKey, systemPrompt);
         const raw = res?.response?.text?.() ?? "";
         const obj = extractJsonObject(raw);
         if (!obj || typeof obj !== "object") throw new Error("AI output invalid");
