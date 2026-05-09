@@ -36,12 +36,43 @@ function ensureReplyLengthBand(text) {
 /**
  * 依 .cursorrules：地圖優先、30～50 字、台灣派遣口語、EmotionScore、禁冗稱與誤導派車語。
  */
-function buildSystemPrompt(draftJson, messageText, kbFareHint = "") {
+function formatConversationBlockForPrompt(entries) {
+  if (!Array.isArray(entries) || !entries.length) return "（尚無）";
+  return entries
+    .slice(-12)
+    .map((e) => {
+      const role = e?.role === "assistant" ? "調度" : "乘客";
+      return `${role}：${String(e?.text ?? "").slice(0, 220)}`;
+    })
+    .join("\n");
+}
+
+function buildSystemPrompt(
+  draftJson,
+  messageText,
+  kbFareHint = "",
+  conversationBlock = "",
+  activeOrderBlock = ""
+) {
   return `
 你是台灣派遣「排車調度」，口語像現場調度：簡短、清楚、不機械。禁用「親愛的顧客」等冗稱。
 
+【對話靈魂（v0.7.4，強制）】
+- 你是「有經驗的真人調度」，不是填表機器人。
+- ride_related=false（閒聊、找老闆、幫朋友問、與叫車無關）：用正常人語氣回，**不要**嘮叨派車欄位、**不要**在 reply 貼「❤️‍🔥加速派車格式」或表格式叫車單。
+- ride_related=true：必須承接「近期對話」與「進行中訂單」上下文。乘客若只說「改去板橋」「改下車」「加停一站」等，你要能辨識是在改**同一筆**需求，並在 reply **自然口語確認改了什麼**（例：好，下車幫你改成板橋），同時把異動寫進 draft。
+- 資料尚未齊備時：像真人一樣一問一答引導，**不要**在 reply 內用「未提供」填滿假格式。
+- 只有在 pickup_verified 與 time_clear 皆 true、真的可派車時，才在語氣上暗示「我這邊幫你整理好了」；**不要**在 reply 內貼整段加速派車格式（卡片由系統在條件成立時附加）。
+- 行程或加價條件變動時，reply 裡的車資說明必須與 knowledge_base 定額／estimated_fare_text 邏輯一致，不可亂報價。
+
 【回覆長度（強制）】
 - reply 全文字數（含標點）必須在 ${REPLY_TARGET_MIN}～${REPLY_MAX_CHARS} 字之間；能更短更好，絕對不可超過 ${REPLY_MAX_CHARS} 字。
+
+【近期對話節錄（舊→新；承接語意）】
+${conversationBlock || "（尚無）"}
+
+【進行中訂單摘要（可能為空；改單語意以此為錨）】
+${activeOrderBlock || "（無）"}
 
 【年份規則（強制）】
 - 當前年份為 2026 年，所有未註明年份的日期（如 5/7）一律視為 2026 年。
@@ -650,7 +681,11 @@ async function generateContentWithGeminiFallback(apiKey, prompt) {
 
 /**
  * @param {string} messageText
- * @param {{ draft?: Record<string,string> }} [options]
+ * @param {{
+ *   draft?: Record<string,string>,
+ *   conversationHistory?: Array<{ role?: string, text?: string }>,
+ *   activeOrderContext?: Record<string, unknown> | null
+ * }} [options]
  * @returns {Promise<{
  *   ride_related: boolean,
  *   emotion_score: number,
@@ -688,7 +723,18 @@ export async function parseOrderFromText(messageText, options = {}) {
     );
 
     const kbFareHint = await buildKbFareHintForPrompt(messageText, prevDraft);
-    const systemPrompt = buildSystemPrompt(draftJson, messageText, kbFareHint);
+    const conversationBlock = formatConversationBlockForPrompt(options.conversationHistory);
+    const activeOrderBlock =
+      options.activeOrderContext && typeof options.activeOrderContext === "object"
+        ? JSON.stringify(options.activeOrderContext, null, 0)
+        : "";
+    const systemPrompt = buildSystemPrompt(
+      draftJson,
+      messageText,
+      kbFareHint,
+      conversationBlock,
+      activeOrderBlock
+    );
 
     let lastErr = null;
     for (let attempt = 0; attempt < 3; attempt++) {

@@ -46,6 +46,7 @@ const activeAlarms = new Map(); // key(orderId) -> timeoutId
 
 // user state (memory)
 // idle | filling_form | waiting_dispatch
+const MAX_CONVERSATION_TURNS = 16;
 const users = {};
 
 // 防重複
@@ -679,16 +680,17 @@ async function handleEvent(event) {
     if (sourceType === "user") {
       const state = getUserState(userId);
       const hasCarKeyword = text.includes("叫車") || text.includes("車");
-      const activeOrder = getActiveOrder(userId);
 
       if (text.includes("取消")) {
         clearAlarmByCustomer(userId);
         deleteOrderByCustomer(userId);
         clearDispatchDraft(userId);
-        setUserState(userId, "idle");
+        setUserState(userId, "idle", { conversationLog: [] });
         await reply(replyToken, "已取消訂單");
         return;
       }
+
+      appendConversationTurn(userId, "user", text);
 
       // v0.3.2：修改時間意圖 → 清除舊 alarm，更新 rideTimestamp 後重設 alarm
       const modifyTimeIntent =
@@ -697,6 +699,7 @@ async function handleEvent(event) {
         const active = getActiveOrder(userId);
         clearAlarm(active.orderId);
 
+        const hist = getConversationLog(userId).slice(0, -1);
         const aiTime = await parseOrderFromText(text, {
           draft: {
             date: active.date || "",
@@ -704,7 +707,9 @@ async function handleEvent(event) {
             pickup: active.pickup || active.address || "",
             dropoff: active.dropoff || "",
             passengers: String(active.passengers ?? "")
-          }
+          },
+          conversationHistory: hist,
+          activeOrderContext: buildActiveOrderContextForAi(userId)
         });
 
         if (aiTime?.ride_timestamp) {
@@ -713,25 +718,30 @@ async function handleEvent(event) {
           if (Number.isFinite(active.rideTimestampMs) && active.isFake && active.date) {
             await scheduleFakeReservationAlert(active);
           }
-          await reply(replyToken, "收到，時間已更新。");
+          const msg = "收到，時間已更新。";
+          await reply(replyToken, msg);
+          appendConversationTurn(userId, "assistant", msg);
           return;
         }
 
-        await reply(replyToken, "收到，要改到哪天幾點呢？");
+        const msg2 = "收到，要改到哪天幾點呢？";
+        await reply(replyToken, msg2);
+        appendConversationTurn(userId, "assistant", msg2);
         return;
       }
 
-      if (activeOrder || state === "waiting_dispatch") {
-        await reply(replyToken, "你目前已有進行中訂單，若要重新叫車請先輸入「取消」");
-        return;
-      }
+      const contextDraft = buildContextDraftForAi(userId);
+      const convHist = getConversationLog(userId).slice(0, -1);
+      const activeCtx = buildActiveOrderContextForAi(userId);
+      const ai = await parseOrderFromText(text, {
+        draft: contextDraft,
+        conversationHistory: convHist,
+        activeOrderContext: activeCtx
+      });
 
-      const prevDraft = getDispatchDraft(userId);
-      const ai = await parseOrderFromText(text, { draft: prevDraft });
-
-      let merged = prevDraft;
+      let merged = contextDraft;
       if (ai) {
-        merged = mergeDispatchDraft(prevDraft, ai.draft);
+        merged = mergeDispatchDraft(contextDraft, ai.draft);
         setDispatchDraft(userId, merged);
       }
 
@@ -760,6 +770,10 @@ async function handleEvent(event) {
           process.env.ADMIN_GROUP_ID,
           `🆘 [未建檔路線求報價]\n上車：${pickup}\n下車：${dropoff}\n系統估計：${est ? `${est.km}km / $${est.fare}` : "未取得"}\n請回覆：/報價 {金額}（臨時） 或 /報價 {金額} fix（永久）`
         );
+        const adminPing =
+          "這條路線請老闆幫忙估價，我這邊已轉過去，有結果再跟你說。";
+        await reply(replyToken, adminPing);
+        appendConversationTurn(userId, "assistant", adminPing);
         return;
       }
 
@@ -775,6 +789,8 @@ async function handleEvent(event) {
         Boolean(ai) && effectivePickupVerified && effectiveTimeClear;
 
       if (driverReady) {
+        const activeForDispatch = getActiveOrder(userId);
+
         // 知識庫機場定額（與 isAirportRideIntent 對齊）；避免 AI 誤走里程公式時卡片車資不符。
         const kbAirportFlat = await estimateAirportFlatFareByKb({
           pickup: merged.pickup,
@@ -811,6 +827,46 @@ async function handleEvent(event) {
         );
         const customerMsg = [safeLead, finalBlock].filter(Boolean).join("\n\n");
 
+        // 已派出／已抵達：不開第二張單，只自然回覆並同步草稿（車資隨 KB 更新）
+        if (activeForDispatch && activeForDispatch.status !== "waiting") {
+          setDispatchDraft(userId, merged);
+          await reply(replyToken, safeLead);
+          appendConversationTurn(userId, "assistant", safeLead);
+          return;
+        }
+
+        const existingWaiting = orders.find(
+          (o) => o.customerId === userId && o.status === "waiting"
+        );
+
+        if (existingWaiting) {
+          applyMergedToWaitingOrder(existingWaiting, merged, finalBlock);
+          if (ai?.ride_timestamp) {
+            const n = normalizeRideTimestampYearTo2026(ai.ride_timestamp);
+            if (n) {
+              existingWaiting.rideTimestamp = n;
+              existingWaiting.rideTimestampMs = Date.parse(n);
+            }
+          }
+          try {
+            await persistDispatchSnapshot(existingWaiting, merged, finalBlock);
+          } catch (e) {
+            console.error("[persistDispatchSnapshot]", e?.message || e);
+            await reply(replyToken, "系統存檔失敗，更新未送出，請稍後再試。");
+            appendConversationTurn(userId, "assistant", "系統存檔失敗，更新未送出，請稍後再試。");
+            return;
+          }
+
+          setDispatchDraft(userId, merged);
+          await reply(replyToken, customerMsg);
+          appendConversationTurn(userId, "assistant", customerMsg);
+          await pushText(
+            DRIVER_GROUP_ID,
+            `📋 訂單更新（${existingWaiting.orderId}）\n\n${finalBlock}`
+          );
+          return;
+        }
+
         const form = draftToRideForm(merged, finalBlock);
         const order = createOrder(userId, form);
 
@@ -819,7 +875,9 @@ async function handleEvent(event) {
         } catch (e) {
           console.error("[persistDispatchSnapshot]", e?.message || e);
           removeOrderById(order.orderId);
-          await reply(replyToken, "系統存檔失敗，派單未完成，請稍後再試。");
+          const failMsg = "系統存檔失敗，派單未完成，請稍後再試。";
+          await reply(replyToken, failMsg);
+          appendConversationTurn(userId, "assistant", failMsg);
           return;
         }
 
@@ -832,6 +890,7 @@ async function handleEvent(event) {
         setUserState(userId, "waiting_dispatch", { orderId: order.orderId });
 
         await reply(replyToken, customerMsg);
+        appendConversationTurn(userId, "assistant", customerMsg);
         await pushText(DRIVER_GROUP_ID, finalBlock);
         return;
       }
@@ -842,16 +901,18 @@ async function handleEvent(event) {
           const legacyDraft = legacyFormToDispatchDraft(legacyForm);
           const mergedFromLegacy = mergeDispatchDraft(merged, legacyDraft);
           setDispatchDraft(userId, mergedFromLegacy);
-          await reply(
-            replyToken,
-            "已讀取您貼上的欄位。接下來仍須由調度依「地圖可定位」方式確認上車點，以及時間是否具體；**兩項都確認完成前，不會對司機群發送任何訊息**。請直接回覆要補充或確認的內容。"
-          );
+          const formAck =
+            "已讀到你貼的欄位。我再跟你核對上車點跟時間，補齊就幫你安排。";
+          await reply(replyToken, formAck);
+          appendConversationTurn(userId, "assistant", formAck);
           return;
         }
       }
 
       if (ai) {
-        await reply(replyToken, sanitizeNonDispatchReply(ai.reply));
+        const out = sanitizeNonDispatchReply(ai.reply);
+        await reply(replyToken, out);
+        appendConversationTurn(userId, "assistant", out);
         if (text.includes("叫車") && getUserState(userId) === "idle") {
           setUserState(userId, "filling_form");
         }
@@ -861,19 +922,20 @@ async function handleEvent(event) {
       if (hasCarKeyword) {
         if (text.includes("叫車")) {
           setUserState(userId, "filling_form");
-          await reply(
-            replyToken,
-`❤️‍🔥加速派車格式❤️‍🔥
+          const formTpl = `❤️‍🔥加速派車格式❤️‍🔥
 
 日期：
 時間：
 上車：
 下車：
-人數：`
-          );
+人數：`;
+          await reply(replyToken, formTpl);
+          appendConversationTurn(userId, "assistant", formTpl);
           return;
         }
-        await reply(replyToken, "調度連線忙碌，請稍後再試；或直接回覆「從哪裡到哪裡、時間、人數」。");
+        const busy = "調度連線忙碌，請稍後再試；或直接回覆「從哪裡到哪裡、時間、人數」。";
+        await reply(replyToken, busy);
+        appendConversationTurn(userId, "assistant", busy);
         return;
       }
 
@@ -1187,6 +1249,63 @@ function getUserState(userId) {
   return users[userId]?.state || "idle";
 }
 
+function getConversationLog(userId) {
+  const log = users[userId]?.conversationLog;
+  return Array.isArray(log) ? log : [];
+}
+
+function appendConversationTurn(userId, role, text) {
+  const cur = users[userId] || {};
+  const log = [...getConversationLog(userId)];
+  log.push({
+    role: role === "assistant" ? "assistant" : "user",
+    text: String(text ?? "").slice(0, 600),
+    at: Date.now()
+  });
+  while (log.length > MAX_CONVERSATION_TURNS) log.shift();
+  users[userId] = { ...cur, conversationLog: log, updatedAt: Date.now() };
+}
+
+function buildContextDraftForAi(userId) {
+  const prev = getDispatchDraft(userId);
+  const active = getActiveOrder(userId);
+  if (!active) return prev;
+  return mergeDispatchDraft(prev, {
+    date: String(active.date ?? prev.date ?? "").trim(),
+    time: String(active.time ?? prev.time ?? "").trim(),
+    pickup: String(active.pickup || active.address || prev.pickup || "").trim(),
+    dropoff: String(active.dropoff ?? prev.dropoff ?? "").trim(),
+    passengers: String(active.passengers ?? prev.passengers ?? "").trim()
+  });
+}
+
+function buildActiveOrderContextForAi(userId) {
+  const active = getActiveOrder(userId);
+  if (!active) return null;
+  return {
+    status: active.status,
+    orderId: active.orderId,
+    pickup: active.pickup || active.address || "",
+    dropoff: active.dropoff || "",
+    time: active.time || "",
+    date: active.date || "",
+    passengers: active.passengers || ""
+  };
+}
+
+function applyMergedToWaitingOrder(order, merged, finalBlock) {
+  order.pickup = String(merged.pickup ?? "").trim();
+  order.address = order.pickup;
+  order.dropoff = String(merged.dropoff ?? "").trim() || order.dropoff;
+  order.time = String(merged.time ?? "").trim() || order.time;
+  order.date = merged.date || order.date;
+  order.passengers = merged.passengers || order.passengers;
+  order.formText = finalBlock;
+  order.estimatedRouteKm = merged.estimated_route_km ?? order.estimatedRouteKm;
+  order.estimatedRouteFare = merged.estimated_route_fare ?? order.estimatedRouteFare;
+  order.estimatedRouteSource = merged.estimated_route_source ?? order.estimatedRouteSource;
+}
+
 function setUserState(userId, state, data = {}) {
   users[userId] = { ...(users[userId] || {}), state, ...data, updatedAt: Date.now() };
 }
@@ -1326,15 +1445,15 @@ function stripDispatchMisleadingPhrases(text) {
 function sanitizeNonDispatchReply(text) {
   let t = stripDispatchMisleadingPhrases(text);
   t = t.replace(/❤️‍🔥加速派車格式❤️‍🔥[\s\S]*/g, "").trim();
-  if (!t || t.length < 4) {
-    return "為確認可派車，請提供完整上車地址（縣市區＋路街門牌或明確地標）以及具體載客時間；若地址有疑義我會再向您核對，謝謝。";
+  if (!t || t.length < 2) {
+    return "好，有需要叫車或改單再跟我說一聲。";
   }
   return t;
 }
 
 function displayDispatchField(v) {
   const s = String(v ?? "").trim();
-  return s || "未提供";
+  return s || "—";
 }
 
 function buildAcceleratedDispatchFormat(d) {
@@ -1343,7 +1462,7 @@ function buildAcceleratedDispatchFormat(d) {
   const vLabel = vtype === "suv" ? "休旅" : vtype === "double_b" ? "雙B" : vtype === "suv_double_b" ? "休旅/雙B" : "";
   const surchargeLine =
     surcharge > 0 ? `車資加成：+${Math.min(100, surcharge)} (${vLabel || "特殊需求"})` : "車資加成：+0";
-  const fareLine = `預計車資：${String(d.estimated_fare_text ?? "").trim() || "未提供"}`;
+  const fareLine = `預計車資：${String(d.estimated_fare_text ?? "").trim() || "—"}`;
   const routeLine =
     d.estimated_route_km && d.estimated_route_fare
       ? `最短里程估價：${d.estimated_route_km}km ($${d.estimated_route_fare})`
@@ -1378,7 +1497,7 @@ function draftToRideForm(d, rawText) {
   const ride_timestamp = d.ride_timestamp || null;
   return {
     pickup,
-    dropoff: dropoff || "未提供",
+    dropoff: dropoff || "—",
     time,
     date: date || null,
     passengers: passengers || null,
