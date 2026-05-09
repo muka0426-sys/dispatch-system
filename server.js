@@ -696,7 +696,13 @@ async function handleEvent(event) {
       }
 
       // v0.3.0：未建檔路線 → 轉管理員報價（暫停對客回覆）
-      if (ai?.needs_admin_pricing && process.env.ADMIN_GROUP_ID) {
+      // 惡搞／未核實上車點：嚴禁對管理群發求報價（避免蟑螂區等仍噴白目卡片）。
+      if (
+        ai?.needs_admin_pricing &&
+        process.env.ADMIN_GROUP_ID &&
+        !ai.is_fake &&
+        Boolean(ai.pickup_verified)
+      ) {
         const pickup = merged.pickup;
         const dropoff = merged.dropoff;
         const key = routeKey(pickup, dropoff);
