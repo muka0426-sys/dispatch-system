@@ -2,7 +2,7 @@ import { GoogleGenerativeAI } from "@google/generative-ai";
 import { readFile } from "node:fs/promises";
 
 const AI_RESOLVER_VERSION = "v7-map-first";
-const FIXED_MODEL_ID = "gemini-1.5-flash";
+const FIXED_MODEL_ID = "models/gemini-1.5-flash";
 
 const REPLY_MAX_CHARS = 50;
 const REPLY_TARGET_MIN = 30;
