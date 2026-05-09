@@ -46,6 +46,11 @@ function buildSystemPrompt(draftJson, messageText) {
 【年份規則（強制）】
 - 當前年份為 2026 年，所有未註明年份的日期（如 5/7）一律視為 2026 年。
 
+【地理與地址核實（強制，常識）】
+- 你現在是台灣專業調度員。解析上車點時，必須核實該縣市、行政區與路名是否在台灣真實存在、且司機導航語境下可合理對應（不可只看字面有「區」「路」就放行）。
+- 若出現明顯虛構、惡搞或地圖上不可能存在的組合（例如：蟑螂區、老鼠路、外星路、不存在的區名路名拼湊），你必須輸出 pickup_verified: false、is_fake: true，並在 reply 中委婉說明此地址查無或無法核實，請對方改為真實可定位的地址（仍須符合字數上限，禁嘲諷）。
+- 若你無法肯定地址真偽，寧可 pickup_verified: false，並簡短請對方補「縣市＋行政區＋路街門牌」或明確地標。
+
 【地址絕對嚴謹（司機保護，強制）】
 - 你必須判斷上車地址是否包含「行政區」(例如：板橋區、中山區、汐止區)。只寫路名（例如：中正路）一律視為不合格。
 - 禁止通靈補地址、禁止猜區域。若只有路名，你必須追問：
@@ -149,6 +154,12 @@ async function lookupKnowledgePrice(pickup, dropoff) {
 function looksLikeFakeDriverNote(messageText) {
   const t = String(messageText ?? "");
   return /(假資|派主|機器人)/.test(t);
+}
+
+/** 與 system prompt 範例對齊；AI 推理為主，此僅後備攔截明顯惡搞字樣。 */
+export function looksLikePromptFictionPickupHint(pickup) {
+  const t = String(pickup ?? "");
+  return /蟑螂區|老鼠路|外星路/.test(t);
 }
 
 function looksLikePricingQuestion(messageText) {
@@ -377,6 +388,40 @@ function isOnlyRoadWithoutDistrict(pickup) {
   return !hasAdminDistrict(t);
 }
 
+/**
+ * AI 優先：若 AI 判定 is_fake，或 pickup_verified 為 false，則不可派車（不因字面上有「區」而放行）。
+ * 僅在「非假資且 AI 聲稱 pickup_verified」時，才允許以結構規則向下加嚴（絕不將 false 改成 true）。
+ * @param {Record<string, unknown>} obj AI 原始 JSON
+ * @param {{ pickup?: string, time?: string }} draft
+ * @param {boolean} [heuristicFake] 例如 looksLikeFakeDriverNote(messageText)
+ * @returns {{ pickup_verified: boolean, time_clear: boolean }}
+ */
+export function finalizePickupDispatchGate(obj, draft, heuristicFake = false) {
+  const pickupText = String(draft?.pickup ?? "").trim();
+  const timeText = String(draft?.time ?? "").trim();
+  const aiDeclaredFake = Boolean(obj?.is_fake) || Boolean(heuristicFake);
+  const aiSaysPickupVerified = Boolean(obj?.pickup_verified);
+  const aiSaysTimeClear = Boolean(obj?.time_clear);
+
+  if (aiDeclaredFake || !aiSaysPickupVerified) {
+    return { pickup_verified: false, time_clear: false };
+  }
+
+  let pickup_verified = aiSaysPickupVerified && Boolean(pickupText);
+  let time_clear = aiSaysTimeClear && Boolean(timeText);
+  if (time_clear && !pickup_verified) time_clear = false;
+
+  if (pickup_verified && !hasAdminDistrict(pickupText)) {
+    pickup_verified = false;
+  }
+  if (pickup_verified && isOnlyRoadWithoutDistrict(pickupText)) {
+    pickup_verified = false;
+  }
+  if (!pickup_verified) time_clear = false;
+
+  return { pickup_verified, time_clear };
+}
+
 function isAirportRideIntent(messageText) {
   const t = String(messageText ?? "");
   if (!/機場/.test(t)) return false;
@@ -589,19 +634,11 @@ export async function parseOrderFromText(messageText, options = {}) {
             estimated_fare_text: String(obj.draft?.estimated_fare_text ?? "").trim()
           };
 
-          let pickup_verified = Boolean(obj.pickup_verified) && Boolean(draft.pickup.trim());
-          let time_clear = Boolean(obj.time_clear) && Boolean(draft.time.trim());
-          if (time_clear && !pickup_verified) time_clear = false;
-
-          // ===== 地址絕對嚴謹（司機保護） =====
-          // 只要像「中正路」這種沒有行政區，就算 AI 說 verified 也一律打回追問。
-          if (pickup_verified && !hasAdminDistrict(draft.pickup)) {
-            pickup_verified = false;
-          }
-          if (pickup_verified && isOnlyRoadWithoutDistrict(draft.pickup)) {
-            pickup_verified = false;
-          }
-          if (!pickup_verified) time_clear = false;
+          const heuristicFake =
+            looksLikeFakeDriverNote(messageText) || looksLikePromptFictionPickupHint(draft.pickup);
+          const aiDeclaredFake = Boolean(obj.is_fake) || heuristicFake;
+          const aiSaysPickupVerified = Boolean(obj.pickup_verified);
+          let { pickup_verified, time_clear } = finalizePickupDispatchGate(obj, draft, heuristicFake);
 
           // ===== 特殊需求（休旅/雙B） =====
           const allowedVehicleTypes = new Set(["", "suv", "double_b", "suv_double_b", "specified"]);
@@ -636,10 +673,14 @@ export async function parseOrderFromText(messageText, options = {}) {
             String(obj.reply ?? "").trim() ||
             "收到，請補縣市區、路名門牌，再加希望時間，謝謝。";
 
-          // 若只有路名（無行政區），強制使用固定追問句（司機保護，禁止通靈）
-          // 若 pickup 已含區／鄉／鎮／市，不可覆寫 AI 原 reply（避免復讀錯誤追問）。
+          // 若只有路名（無行政區），且 AI 已認為可核實、非假資，才補固定追問；其餘一律保留 AI reply。
           const pickupHasAdminMarker = /(區|鄉|鎮|市)/.test(String(draft.pickup ?? ""));
-          if (isOnlyRoadWithoutDistrict(draft.pickup) && !pickupHasAdminMarker) {
+          if (
+            !aiDeclaredFake &&
+            aiSaysPickupVerified &&
+            isOnlyRoadWithoutDistrict(draft.pickup) &&
+            !pickupHasAdminMarker
+          ) {
             const road = extractRoadName(draft.pickup) || extractRoadName(messageText) || "這條路";
             reply = `請問是哪一個區的${road}呢？為了避免司機跑錯，再麻煩提供一下喔！🥰`;
           }
@@ -679,7 +720,7 @@ export async function parseOrderFromText(messageText, options = {}) {
           draft.estimated_fare_text = `${draft.estimated_fare_text}；等候5分後$5/分`;
 
           // ===== v0.3.0：假資偵測 + ride_timestamp + 未建檔報價攔截 =====
-          const is_fake = looksLikeFakeDriverNote(messageText) || Boolean(obj.is_fake);
+          const is_fake = heuristicFake || Boolean(obj.is_fake);
 
           const ride_timestamp =
             (typeof obj.ride_timestamp === "string" && obj.ride_timestamp.includes("T"))
