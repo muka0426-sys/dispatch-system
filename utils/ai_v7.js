@@ -424,7 +424,9 @@ export function finalizePickupDispatchGate(obj, draft, heuristicFake = false) {
 
 function isAirportRideIntent(messageText) {
   const t = String(messageText ?? "");
-  if (!/機場/.test(t)) return false;
+  // 「送機／接機／桃機」常見寫法不含「機場」二字，不可只依賴 /機場/。
+  if (/(送機|接機)/.test(t)) return true;
+  if (!/(機場|桃機|桃園機場|國際機場|松山機場|航廈)/.test(t)) return false;
   return /(去|到|送|接|載|搭|前往|從|出發)/.test(t);
 }
 
@@ -477,7 +479,7 @@ function normalizeDistrictHint(text) {
   return "";
 }
 
-async function estimateAirportFlatFareByKb({ pickup, messageText, dropoff }) {
+export async function estimateAirportFlatFareByKb({ pickup, messageText, dropoff }) {
   // Use knowledge_base.json airport_flat_rates if available.
   // Only applies when intent is airport ride and destination mentions airport.
   if (!isTaoyuanAirportMentioned(dropoff || messageText)) return null;

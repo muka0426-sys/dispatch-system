@@ -13,7 +13,8 @@ import {
   validateRsBid,
   canRsRapeTie,
   rsCheckOvercharge,
-  getGoogleShortestRouteEstimate
+  getGoogleShortestRouteEstimate,
+  estimateAirportFlatFareByKb
 } from "./utils/ai_v7.js";
 
 console.log("[boot] server.js", {
@@ -728,6 +729,19 @@ async function handleEvent(event) {
         Boolean(ai) && effectivePickupVerified && effectiveTimeClear;
 
       if (driverReady) {
+        // 知識庫機場定額（與 isAirportRideIntent 對齊）；避免 AI 誤走里程公式時卡片車資不符。
+        const kbAirportFlat = await estimateAirportFlatFareByKb({
+          pickup: merged.pickup,
+          messageText: text,
+          dropoff: merged.dropoff
+        });
+        if (kbAirportFlat != null) {
+          const sur = Number(merged.fare_surcharge) || 0;
+          let estLine = `機場定額 $${kbAirportFlat}；等候5分後$5/分`;
+          if (sur > 0) estLine += `；加價+$${sur}`;
+          merged = { ...merged, estimated_fare_text: estLine };
+        }
+
         // v0.2.0：派單前抓 Google Map 最短里程估價（基準）
         const routeEst = await getGoogleShortestRouteEstimate({
           origin: merged.pickup,
@@ -1009,8 +1023,14 @@ function getActiveOrder(customerId) {
   return null;
 }
 
+/**
+ * 取「目前待喊單／待標記」的訂單。必須是最新一筆 waiting，否則司機喊單會寫進舊單，
+ * @ 標記時讀到的 bids 為空 →「沒有有效喊單」。（activeAlarms 僅假資倒數，與喊單無關。）
+ */
 function getNextWaitingOrder() {
-  return orders.find((order) => order.status === "waiting");
+  const waiting = orders.filter((order) => order.status === "waiting");
+  if (!waiting.length) return null;
+  return waiting.reduce((a, b) => (a.createdAt >= b.createdAt ? a : b));
 }
 
 function getWaitingOrderByPendingDriver(driverUserId) {
