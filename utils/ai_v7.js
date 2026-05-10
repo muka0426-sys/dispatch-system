@@ -6,6 +6,8 @@ const FIXED_MODEL_ID = "gemini-1.5-flash";
 
 const REPLY_MAX_CHARS = 50;
 const REPLY_TARGET_MIN = 30;
+/** 問答／解釋情境：允許較長、像真人客服（仍設上限避免洗版） */
+const REPLY_MAX_CHARS_LONG = 480;
 const RS_RULES_VERSION = "v0.1.9";
 const KB_FILE = "knowledge_base.json";
 
@@ -31,6 +33,22 @@ function ensureReplyLengthBand(text) {
   if ([...t].length >= REPLY_TARGET_MIN) return t;
   t = clipReplyToMaxChars(`${t} ${pad}`, REPLY_MAX_CHARS);
   return t || clipReplyToMaxChars("收到，請補縣市區、路名門牌與時間。", REPLY_MAX_CHARS);
+}
+
+/** 客人是否在問事／要說明（可較長回覆）；純補地址則維持短回。 */
+function guestMessageLooksLikeSubstantiveQuestion(messageText) {
+  const t = String(messageText ?? "").trim();
+  if (!t) return false;
+  if (looksLikePricingQuestion(t)) return true;
+  if (
+    /\?|？|什麼|為什麼|为啥|怎麼|怎办|多少|可以嗎|能不能|行嗎|請問|會不會|有沒有|解釋|說明|差別|比較|建議|怕|擔心|會不會太小|大車|行李|寵物|搬家/.test(
+      t
+    )
+  ) {
+    return true;
+  }
+  if ([...t].length >= 36) return true;
+  return false;
 }
 
 /**
@@ -73,8 +91,10 @@ function buildSystemPrompt(
 - 行程或加價條件變動時，reply 裡的車資說明必須與 knowledge_base 定額／estimated_fare_text 邏輯一致，不可亂報價。
 - 一旦 pickup_verified=true 且 draft.pickup 非空：你必須把該上車點當作已核實的既定事實，**嚴禁**再問「請問哪一區／哪裡上車／是哪個縣市區」。若仍缺資料，只能追問缺的欄位（例如下車點或時間）。
 
-【回覆長度（強制）】
-- reply 全文字數（含標點）必須在 ${REPLY_TARGET_MIN}～${REPLY_MAX_CHARS} 字之間；能更短更好，絕對不可超過 ${REPLY_MAX_CHARS} 字。
+【回覆長度（v0.7.7：情境式，禁止一律罐頭）】
+- **客人只在補地址／時間／人數、語句單純**：reply 維持精簡（約 ${REPLY_TARGET_MIN}～${REPLY_MAX_CHARS} 字），例如「收到，幫您派車」這類自然短句即可。
+- **客人有問句、議價／加價原因、車型大小、等候費、流程疑慮等**：要像**真人客服**，口語有禮、把重點講清楚；可寫到約 ${REPLY_MAX_CHARS_LONG} 字內，**嚴禁**用千篇一律的制式句硬剪短。
+- **ride_related=false** 的閒聊：自然長度即可，不必硬塞派車欄位。
 
 【近期對話節錄（舊→新；承接語意）】
 ${conversationBlock || "（尚無）"}
@@ -91,7 +111,7 @@ ${activeOrderBlock || "（無）"}
 
 【地理與地址核實（強制，常識）】
 - 你現在是台灣專業調度員。解析上車點時，必須核實該縣市、行政區與路名是否在台灣真實存在、且司機導航語境下可合理對應（不可只看字面有「區」「路」就放行）。
-- 若出現明顯虛構、惡搞或地圖上不可能存在的組合（例如：蟑螂區、老鼠路、外星路、不存在的區名路名拼湊），你必須輸出 pickup_verified: false、is_fake: true，並在 reply 中委婉說明此地址查無或無法核實，請對方改為真實可定位的地址（仍須符合字數上限，禁嘲諷）。
+- 若出現明顯虛構、惡搞或地圖上不可能存在的組合（例如：蟑螂區、老鼠路、外星路、不存在的區名路名拼湊），你必須輸出 pickup_verified: false、is_fake: true，並在 reply 中委婉說明此地址查無或無法核實，請對方改為真實可定位的地址（禁嘲諷；說明可較完整）。
 - 若你無法肯定地址真偽，寧可 pickup_verified: false，並簡短請對方補「縣市＋行政區＋路街門牌」或明確地標。
 
 【地址絕對嚴謹（司機保護，強制）】
@@ -119,7 +139,7 @@ ${kbFareHint ? kbFareHint : "（本則尚未由系統預先命中 KB 定額；�
 - 疑似酒醉、意識不清、語無倫次、情緒失控 → emotion_score 至少 70。
 - 一般略急 → 約 35～55。
 - 冷靜明確 → 0～25。
-- 你必須輸出欄位 emotion_score（數字）。若 emotion_score ≥ 40，reply 內須含**一句極短安撫**（例如：先別急／我這邊幫你看），且仍須符合字數上限。
+- 你必須輸出欄位 emotion_score（數字）。若 emotion_score ≥ 40，reply 內須含**一句安撫**（例如：先別急／我這邊幫你看），並在對方有疑問時給足說明，不要為了短而敷衍。
 
 【Map-First】
 - 以司機用導航能否在台灣精準到點思考；不依門牌數字大小否決。
@@ -261,8 +281,12 @@ export function alignCustomerReplyToEstimatedFare(reply, estimatedFareText) {
   return `${t} ${tail}`.trim();
 }
 
-export function finalizeCustomerFareReply(reply, estimatedFareText) {
-  return ensureReplyLengthBand(alignCustomerReplyToEstimatedFare(reply, estimatedFareText));
+export function finalizeCustomerFareReply(reply, estimatedFareText, messageText = "") {
+  const aligned = alignCustomerReplyToEstimatedFare(reply, estimatedFareText);
+  if (guestMessageLooksLikeSubstantiveQuestion(messageText)) {
+    return clipReplyToMaxChars(aligned, REPLY_MAX_CHARS_LONG);
+  }
+  return ensureReplyLengthBand(aligned);
 }
 
 function suppressAddressReaskWhenPickupVerified(reply, pickup_verified, draft) {
@@ -983,7 +1007,7 @@ export async function parseOrderFromText(messageText, options = {}) {
           reply = stripUnwarrantedVehicleSurchargeClaims(reply, draft.vehicle_request_type);
           reply = ensureSurchargeQuestionInReply(reply, draft.vehicle_request_type);
           reply = suppressAddressReaskWhenPickupVerified(reply, pickup_verified, draft);
-          reply = finalizeCustomerFareReply(reply, draft.estimated_fare_text);
+          reply = finalizeCustomerFareReply(reply, draft.estimated_fare_text, messageText);
 
           return {
             ride_related: Boolean(obj.ride_related),

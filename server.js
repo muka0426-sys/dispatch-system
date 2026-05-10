@@ -465,11 +465,15 @@ async function handleEvent(event) {
 
         await reply(replyToken, "已標記，車卡我這邊直接噴。");
 
-        await pushText(
-          waitingOrder.customerId,
-`🚗 已為您安排司機
+        const dispatchBody = acceleratedDispatchBlockFromOrder(waitingOrder);
+        await pushText(DRIVER_GROUP_ID, wrapRsSpecialistDispatch(dispatchBody)).catch((e) =>
+          console.error("[push DRIVER_GROUP RS matched]", e?.message || e)
+        );
 
-司機${waitingOrder.driverEta}${waitingOrder.driverEta === "準" ? "" : "分"}抵達`
+        await notifyCustomerDriverMatched(
+          waitingOrder.customerId,
+          leader.driverUserId,
+          waitingOrder.driverEta
         );
 
         const cardText = getDriverCardText(leader.driverUserId);
@@ -541,14 +545,14 @@ async function handleEvent(event) {
 
         await reply(replyToken, "已派你出發 🚗");
 
-        await pushText(
-          cardTargetOrder.customerId,
-`🚗 已為您安排司機
-
-司機${pending.time}分抵達`
+        const dispatchBodyMatched = acceleratedDispatchBlockFromOrder(cardTargetOrder);
+        await pushText(DRIVER_GROUP_ID, wrapRsSpecialistDispatch(dispatchBodyMatched)).catch((e) =>
+          console.error("[push DRIVER_GROUP RS matched pending]", e?.message || e)
         );
 
-        // 👉 再補車卡（第二則）
+        await notifyCustomerDriverMatched(cardTargetOrder.customerId, userId, pending.time);
+
+        // 👉 再補車卡（司機自貼卡片）
         await pushText(cardTargetOrder.customerId, text);
         delete pendingDriver[cardTargetOrder.orderId];
 
@@ -829,7 +833,8 @@ async function handleEvent(event) {
         const finalBlock = buildAcceleratedDispatchFormat(merged);
         const safeLead = finalizeCustomerFareReply(
           stripDispatchMisleadingPhrases(ai.reply),
-          merged.estimated_fare_text
+          merged.estimated_fare_text,
+          text
         );
 
         const fareChatOnly =
@@ -849,10 +854,16 @@ async function handleEvent(event) {
         if (activeForDispatch && activeForDispatch.status !== "waiting") {
           setDispatchDraft(userId, merged);
           const diff = summarizeOrderChangesForDriver(activeForDispatch, merged);
-          if (activeForDispatch.status === "matched" && activeForDispatch.driverId && diff) {
+          const postMatchDriverNotify = new Set(["matched", "arrived"]);
+          if (
+            postMatchDriverNotify.has(activeForDispatch.status) &&
+            activeForDispatch.driverId &&
+            diff
+          ) {
+            const dname = getDriverDisplayName(activeForDispatch.driverId);
             await pushText(
               DRIVER_GROUP_ID,
-              `@${activeForDispatch.driverId} 訂單${activeForDispatch.orderId}更新：${diff}`
+              `【司機 ${dname}】客人更新：${diff}`
             );
             const msg = "好的，已幫您通知司機。";
             await reply(replyToken, msg);
@@ -891,7 +902,10 @@ async function handleEvent(event) {
           await reply(replyToken, customerMsg);
           appendConversationTurn(userId, "assistant", customerMsg);
           // 一單一卡：waiting 狀態允許更新卡；matched 後改走「通知司機變動」。
-          await pushText(DRIVER_GROUP_ID, `📋 訂單更新（${existingWaiting.orderId}）\n\n${finalBlock}`);
+          await pushText(
+            DRIVER_GROUP_ID,
+            wrapRsSpecialistDispatch(`📋 訂單更新（${existingWaiting.orderId}）\n\n${finalBlock}`)
+          );
           return;
         }
 
@@ -919,7 +933,7 @@ async function handleEvent(event) {
 
         await reply(replyToken, customerMsg);
         appendConversationTurn(userId, "assistant", customerMsg);
-        await pushText(DRIVER_GROUP_ID, finalBlock);
+        await pushText(DRIVER_GROUP_ID, wrapRsSpecialistDispatch(finalBlock));
         return;
       }
 
@@ -1077,6 +1091,65 @@ function getDriverCardText(driverUserId) {
     }
   }
   return "（尚未設定車卡）";
+}
+
+/** 司機顯示名（推播給客人、司機群純文字更新）；可設 DRIVER_NAMES_JSON={"Uxxx":"阿明"} */
+function getDriverDisplayName(driverUserId) {
+  const id = String(driverUserId ?? "").trim();
+  const raw = (process.env.DRIVER_NAMES_JSON || "").trim();
+  if (raw && id) {
+    try {
+      const map = JSON.parse(raw);
+      const n = map?.[id];
+      if (n) return String(n).trim() || "司機夥伴";
+    } catch (e) {
+      console.error("[DRIVER_NAMES_JSON] invalid json");
+    }
+  }
+  return "司機夥伴";
+}
+
+function wrapRsSpecialistDispatch(body) {
+  const b = String(body ?? "").trim();
+  if (!b) return "❤️‍🔥RS • 專員🔥";
+  return `❤️‍🔥RS • 專員🔥\n\n${b}`;
+}
+
+function acceleratedDispatchBlockFromOrder(order) {
+  const ft = String(order?.formText ?? "").trim();
+  if (ft.includes("加速派車格式")) return ft;
+  return buildAcceleratedDispatchFormat({
+    date: order?.date || "",
+    time: order?.time || "",
+    pickup: order?.pickup || order?.address || "",
+    dropoff: order?.dropoff || "",
+    passengers: order?.passengers || "",
+    vehicle_request_type: "",
+    fare_surcharge: 0,
+    estimated_fare_text:
+      order?.estimatedRouteFare != null && Number.isFinite(Number(order.estimatedRouteFare))
+        ? `系統參考 $${order.estimatedRouteFare}`
+        : "—",
+    estimated_route_km: order?.estimatedRouteKm ?? null,
+    estimated_route_fare: order?.estimatedRouteFare ?? null,
+    estimated_route_source: order?.estimatedRouteSource ?? null
+  });
+}
+
+/** 接單成功：反向推播客人（Push），避免空等 */
+async function notifyCustomerDriverMatched(customerId, driverUserId, driverEta) {
+  const name = getDriverDisplayName(driverUserId);
+  const eta = String(driverEta ?? "").trim();
+  let etaPhrase;
+  if (!eta || eta === "準") {
+    etaPhrase = "已接單，將依約定時間前往";
+  } else if (/^\d+$/.test(eta)) {
+    etaPhrase = `約 ${eta} 分鐘抵達`;
+  } else {
+    etaPhrase = `約 ${eta} 抵達`;
+  }
+  const msg = `已為您安排司機：${name}，${etaPhrase}，請稍候。`;
+  await pushText(customerId, msg);
 }
 
 async function appendLogicErrorLog({
