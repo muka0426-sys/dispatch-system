@@ -15,7 +15,8 @@ import {
   rsCheckOvercharge,
   getGoogleShortestRouteEstimate,
   estimateAirportFlatFareByKb,
-  finalizeCustomerFareReply
+  finalizeCustomerFareReply,
+  looksLikePricingQuestion
 } from "./utils/ai_v7.js";
 
 console.log("[boot] server.js", {
@@ -307,8 +308,10 @@ async function handleEvent(event) {
       )
     ) {
       console.log("[AI] parseOrderFromText() input:", text);
+      const currentDateTime = new Date();
       aiResult = await parseOrderFromText(text, {
-        draft: { date: "", time: "", pickup: "", dropoff: "", passengers: "" }
+        draft: { date: "", time: "", pickup: "", dropoff: "", passengers: "" },
+        now: currentDateTime
       });
       console.log("[AI] Result:", aiResult);
     }
@@ -700,6 +703,7 @@ async function handleEvent(event) {
         clearAlarm(active.orderId);
 
         const hist = getConversationLog(userId).slice(0, -1);
+        const currentDateTime = new Date();
         const aiTime = await parseOrderFromText(text, {
           draft: {
             date: active.date || "",
@@ -709,7 +713,8 @@ async function handleEvent(event) {
             passengers: String(active.passengers ?? "")
           },
           conversationHistory: hist,
-          activeOrderContext: buildActiveOrderContextForAi(userId)
+          activeOrderContext: buildActiveOrderContextForAi(userId),
+          now: currentDateTime
         });
 
         if (aiTime?.ride_timestamp) {
@@ -733,10 +738,12 @@ async function handleEvent(event) {
       const contextDraft = buildContextDraftForAi(userId);
       const convHist = getConversationLog(userId).slice(0, -1);
       const activeCtx = buildActiveOrderContextForAi(userId);
+      const currentDateTime = new Date();
       const ai = await parseOrderFromText(text, {
         draft: contextDraft,
         conversationHistory: convHist,
-        activeOrderContext: activeCtx
+        activeOrderContext: activeCtx,
+        now: currentDateTime
       });
 
       let merged = contextDraft;
@@ -824,6 +831,17 @@ async function handleEvent(event) {
           stripDispatchMisleadingPhrases(ai.reply),
           merged.estimated_fare_text
         );
+
+        const fareChatOnly =
+          !isTripMateriallyChanged(contextDraft, merged, currentDateTime) &&
+          isLikelyFareExplanationOnly(text);
+        if (fareChatOnly) {
+          setDispatchDraft(userId, merged);
+          await reply(replyToken, safeLead);
+          appendConversationTurn(userId, "assistant", safeLead);
+          return;
+        }
+
         const customerMsg = [safeLead, finalBlock].filter(Boolean).join("\n\n");
 
         // 一單一卡：已標記成功（matched/arrived）後，乘客補齊或修改 → 不重噴整張卡。
@@ -1157,11 +1175,78 @@ function getActiveOrder(customerId) {
   return null;
 }
 
-/** 取 createdAt 最新的一筆 waiting（@ 標記、純分鐘喊單用）。 */
-function getLatestWaitingOrder() {
-  const waiting = orders.filter((order) => order.status === "waiting");
-  if (!waiting.length) return null;
-  return waiting.reduce((a, b) => (a.createdAt >= b.createdAt ? a : b));
+function todayYmdTaipei(d = new Date()) {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Taipei",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).format(d);
+}
+
+function orderBookingYmd(order) {
+  const ds = String(order?.date ?? "").trim();
+  if (ds) {
+    const m4 = ds.match(/^(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})/);
+    if (m4) {
+      return `${m4[1]}-${String(m4[2]).padStart(2, "0")}-${String(m4[3]).padStart(2, "0")}`;
+    }
+    const m2 = ds.match(/^(\d{1,2})[\/\-](\d{1,2})$/);
+    if (m2) {
+      return `2026-${String(m2[1]).padStart(2, "0")}-${String(m2[2]).padStart(2, "0")}`;
+    }
+  }
+  const ms = Number(order?.rideTimestampMs);
+  if (Number.isFinite(ms) && ms > 0) {
+    return new Intl.DateTimeFormat("en-CA", {
+      timeZone: "Asia/Taipei",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit"
+    }).format(new Date(ms));
+  }
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Taipei",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).format(new Date(order.createdAt));
+}
+
+/** 僅「預約日／發車日為今日（台北日曆）」的 waiting 單，供喊單／標記綁定。 */
+function waitingOrdersToday() {
+  const today = todayYmdTaipei();
+  return orders.filter(
+    (order) => order.status === "waiting" && orderBookingYmd(order) === today
+  );
+}
+
+function normalizeTripKey(s) {
+  return String(s ?? "")
+    .replace(/\s+/g, "")
+    .trim();
+}
+
+function dateKeyFromDispatchDraft(draft, refNow = new Date()) {
+  const ds = String(draft?.date ?? "").trim();
+  if (!ds) return todayYmdTaipei(refNow);
+  return orderBookingYmd({ date: ds, rideTimestampMs: null, createdAt: Date.now() });
+}
+
+function isTripMateriallyChanged(prev, next, refNow = new Date()) {
+  if (normalizeTripKey(prev?.pickup) !== normalizeTripKey(next?.pickup)) return true;
+  if (normalizeTripKey(prev?.time) !== normalizeTripKey(next?.time)) return true;
+  if (normalizeTripKey(prev?.dropoff) !== normalizeTripKey(next?.dropoff)) return true;
+  if (dateKeyFromDispatchDraft(prev, refNow) !== dateKeyFromDispatchDraft(next, refNow)) return true;
+  return false;
+}
+
+function isLikelyFareExplanationOnly(text) {
+  const t = String(text ?? "");
+  if (looksLikePricingQuestion(t)) return true;
+  return /為什麼|啥原因|什麼原因|怎麼算|等候|等待費|加價原因|會不會加收|有沒有另|說明|解釋|啥是|什麼是|原因/.test(
+    t
+  );
 }
 
 const DRIVER_BID_STOP_TOKENS = new Set([
@@ -1196,11 +1281,9 @@ function orderMatchesLocationTokens(order, tokens) {
  * 司機群：@ 標記 → 永遠綁最新 waiting；喊單 → 優先比對訊息中的地名與訂單上／下車址（如：南港 ⊆ 台北市南港區）。
  */
 function getWaitingOrderForDriverMessage(text, { isDispatcherMark }) {
-  if (isDispatcherMark) return getLatestWaitingOrder();
-  const waiting = orders
-    .filter((order) => order.status === "waiting")
-    .sort((a, b) => b.createdAt - a.createdAt);
+  const waiting = waitingOrdersToday().sort((a, b) => b.createdAt - a.createdAt);
   if (!waiting.length) return null;
+  if (isDispatcherMark) return waiting[0];
   if (waiting.length === 1) return waiting[0];
   const tokens = extractLocationTokensForBidMatch(text);
   const matched = waiting.filter((o) => orderMatchesLocationTokens(o, tokens));

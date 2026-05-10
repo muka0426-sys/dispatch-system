@@ -52,10 +52,17 @@ function buildSystemPrompt(
   messageText,
   kbFareHint = "",
   conversationBlock = "",
-  activeOrderBlock = ""
+  activeOrderBlock = "",
+  clockDateStr = "",
+  clockTimeStr = ""
 ) {
   return `
 你是台灣派遣「排車調度」，口語像現場調度：簡短、清楚、不機械。禁用「親愛的顧客」等冗稱。
+
+【現在時間錨點（鐵律，禁止通靈）】
+- 今日日期為 ${clockDateStr || "（未提供）"}，現在時間為 ${clockTimeStr || "（未提供）"}。
+- 若客人本則未指定日期，draft.date 必須以「今日」為準；**嚴禁**沿用近期對話或草稿裡的舊日期（例如 05-07、去年今日）。
+- 未註明年份之月/日，一律視為 2026 年。
 
 【對話靈魂（v0.7.4，強制）】
 - 你是「有經驗的真人調度」，不是填表機器人。
@@ -77,6 +84,10 @@ ${activeOrderBlock || "（無）"}
 
 【年份規則（強制）】
 - 當前年份為 2026 年，所有未註明年份的日期（如 5/7）一律視為 2026 年。
+
+【加價欄位 fare_surcharge（鐵律）】
+- 輸出 JSON 時 fare_surcharge **必須為 0**，除非客人本則文字**明確**出現：要大車、指定雙B、休旅車、休旅、SUV、搬家、寵物等需求。
+- **嚴禁**在 reply 捏造「已幫你加休旅／雙B 加價」等理由；沒有上述字眼就不要提特殊車款加價。
 
 【地理與地址核實（強制，常識）】
 - 你現在是台灣專業調度員。解析上車點時，必須核實該縣市、行政區與路名是否在台灣真實存在、且司機導航語境下可合理對應（不可只看字面有「區」「路」就放行）。
@@ -101,7 +112,7 @@ ${kbFareHint ? kbFareHint : "（本則尚未由系統預先命中 KB 定額；�
 【等待費與特殊加價（強制）】
 - 等待費：司機抵達後緩衝 5 分鐘，超過後每分鐘 5 元。客人問起時 reply 必須包含：「1分鐘都是5元喲🥰」。
 - 暫時下車：若客人要求暫下/中途下車，不適用緩衝，立即以每分鐘 5 元開始計費（同樣要帶「1分鐘都是5元喲🥰」）。
-- 特殊需求：指定「休旅車」或「雙B」加收 $100；兩者同時存在不疊加（只收一次 $100）。
+- 車種加價 $100：**僅當**客人本則明確提到要大車／休旅或 SUV／指定雙B（或明確雙B 品牌）／搬家／寵物時，系統才會加；兩者同時存在不疊加。**不要**因泛泛的「指定」就假設要加價。
 
 【EmotionScore（0～100，整數）】
 - 依本則訊息判斷乘客情緒負荷：著急、重複催促、髒話、恐懼、抱怨等 → 分數偏高；平穩敘述地址／時間 → 偏低。
@@ -281,7 +292,7 @@ export function looksLikePromptFictionPickupHint(pickup) {
   return /蟑螂區|老鼠路|外星路/.test(t);
 }
 
-function looksLikePricingQuestion(messageText) {
+export function looksLikePricingQuestion(messageText) {
   const t = String(messageText ?? "");
   return /(多少錢|幾錢|車資|費用|報價|怎麼算|多少算)/.test(t);
 }
@@ -412,21 +423,75 @@ function parseRideTimestampFromDraft({ date, time }) {
   return normalizeRideTimestampYearTo2026(dt.toISOString());
 }
 
-function detectVehicleRequestType(messageText) {
+/**
+ * 車種加價：僅在客人本則**明確**出現關鍵需求時才回傳非空（嚴禁寬鬆「指定」誤判）。
+ */
+function detectExplicitVehicleSurchargeType(messageText) {
   const t = String(messageText ?? "");
   if (!t.trim()) return "";
 
-  const hasSuv = /(休旅|SUV|休旅車)/i.test(t);
-  const hasDoubleB = /(雙\s*B|BMW|賓士|Benz|Mercedes)/i.test(t);
-  const hasHighEnd = /(高級車|豪華車|高檔車)/.test(t);
-  const hasSpecified = /(指定|要.+車|要.+款|要.+型)/.test(t);
+  if (/搬家/.test(t)) return "specified";
+  if (/寵物/.test(t)) return "specified";
 
-  // 指定費：只要是指定車種而非隨機派發，一律 +100（不疊加）
+  if (/(要大車|九人座|9人座|七人座|7人座)/.test(t)) return "specified";
+
+  const hasSuv = /(休旅車|休旅|SUV)/i.test(t);
+  const hasDoubleB = /(指定\s*雙\s*B|BMW|賓士|Benz|Mercedes)/i.test(t);
+
   if (hasSuv && hasDoubleB) return "suv_double_b";
   if (hasSuv) return "suv";
   if (hasDoubleB) return "double_b";
-  if (hasHighEnd || hasSpecified) return "specified";
   return "";
+}
+
+function pad2(n) {
+  return String(n).padStart(2, "0");
+}
+
+/** 正規化 draft.date：缺欄位→今日（台北日曆）；缺年份→2026；舊年分 2024/2025→2026 */
+function normalizeDraftDateTo2026(draftDateStr, refNow) {
+  const ref =
+    refNow instanceof Date && Number.isFinite(refNow.getTime()) ? refNow : new Date();
+  const forced = forcedCurrentYear();
+
+  if (!String(draftDateStr ?? "").trim()) {
+    const ymd = new Intl.DateTimeFormat("en-CA", {
+      timeZone: "Asia/Taipei",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit"
+    }).format(ref);
+    const [y, m, d] = ymd.split("-");
+    const yy = y === "2024" || y === "2025" ? forced : y;
+    return `${yy}-${m}-${d}`;
+  }
+
+  const s = String(draftDateStr).trim();
+  const mFull = s.match(/^(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})/);
+  if (mFull) {
+    let yy = mFull[1];
+    if (yy === "2024" || yy === "2025") yy = String(forced);
+    return `${yy}-${pad2(mFull[2])}-${pad2(mFull[3])}`;
+  }
+  const mPart = s.match(/^(\d{1,2})[\/\-](\d{1,2})$/);
+  if (mPart) {
+    return `${forced}-${pad2(mPart[1])}-${pad2(mPart[2])}`;
+  }
+  const mZh = s.match(/(\d{1,2})\s*月\s*(\d{1,2})\s*日?/);
+  if (mZh) {
+    return `${forced}-${pad2(mZh[1])}-${pad2(mZh[2])}`;
+  }
+  return s;
+}
+
+function stripUnwarrantedVehicleSurchargeClaims(reply, vehicleRequestType) {
+  if (vehicleRequestType) return String(reply ?? "");
+  let r = String(reply ?? "");
+  r = r.replace(/另外(要)?.{0,16}加價\d+可嗎[？?]?/gi, "");
+  r = r.replace(/(已幫|幫你).{0,12}(休旅|雙B|指定車|特殊車款)/g, "");
+  r = r.replace(/(休旅|雙B|指定車種|特殊車款).{0,12}加價/g, "");
+  r = r.replace(/\s{2,}/g, " ").trim();
+  return r;
 }
 
 function vehicleTypeLabel(vehicle_request_type) {
@@ -701,7 +766,8 @@ async function generateContentWithGeminiFallback(apiKey, prompt) {
  * @param {{
  *   draft?: Record<string,string>,
  *   conversationHistory?: Array<{ role?: string, text?: string }>,
- *   activeOrderContext?: Record<string, unknown> | null
+ *   activeOrderContext?: Record<string, unknown> | null,
+ *   now?: Date
  * }} [options]
  * @returns {Promise<{
  *   ride_related: boolean,
@@ -722,8 +788,15 @@ export async function parseOrderFromText(messageText, options = {}) {
     }
 
     invalidateKnowledgeBaseCache();
+    const currentDateTime =
+      options.now instanceof Date && Number.isFinite(options.now.getTime())
+        ? options.now
+        : new Date();
+    const clockDateStr = currentDateTime.toLocaleDateString("zh-TW");
+    const clockTimeStr = currentDateTime.toLocaleTimeString("zh-TW");
+
     const prevDraft = options.draft || {};
-    const vehicle_request_type_hint = detectVehicleRequestType(messageText);
+    const vehicle_request_type_hint = detectExplicitVehicleSurchargeType(messageText);
     const draftJson = JSON.stringify(
       {
         date: prevDraft.date || "",
@@ -750,7 +823,9 @@ export async function parseOrderFromText(messageText, options = {}) {
       messageText,
       kbFareHint,
       conversationBlock,
-      activeOrderBlock
+      activeOrderBlock,
+      clockDateStr,
+      clockTimeStr
     );
 
     let lastErr = null;
@@ -767,10 +842,12 @@ export async function parseOrderFromText(messageText, options = {}) {
             pickup: String(obj.draft?.pickup ?? "").trim(),
             dropoff: String(obj.draft?.dropoff ?? "").trim(),
             passengers: String(obj.draft?.passengers ?? "").trim(),
-            vehicle_request_type: String(obj.draft?.vehicle_request_type ?? "").trim(),
-            fare_surcharge: Number(obj.draft?.fare_surcharge ?? 0),
+            vehicle_request_type: "",
+            fare_surcharge: 0,
             estimated_fare_text: String(obj.draft?.estimated_fare_text ?? "").trim()
           };
+
+          draft.date = normalizeDraftDateTo2026(draft.date, currentDateTime);
 
           const heuristicFake =
             looksLikeFakeDriverNote(messageText) || looksLikePromptFictionPickupHint(draft.pickup);
@@ -778,24 +855,15 @@ export async function parseOrderFromText(messageText, options = {}) {
           const aiSaysPickupVerified = Boolean(obj.pickup_verified);
           let { pickup_verified, time_clear } = finalizePickupDispatchGate(obj, draft, heuristicFake);
 
-          // ===== 特殊需求（休旅/雙B） =====
-          const allowedVehicleTypes = new Set(["", "suv", "double_b", "suv_double_b", "specified"]);
-          if (!allowedVehicleTypes.has(draft.vehicle_request_type)) {
-            draft.vehicle_request_type = "";
-          }
-
-          draft.fare_surcharge = Number.isFinite(draft.fare_surcharge)
-            ? Math.max(0, Math.min(100, Math.round(draft.fare_surcharge)))
+          // ===== 特殊需求（休旅/雙B）：完全以本則明確關鍵字為準，忽略模型輸出 =====
+          const allowedVehicleTypes = new Set(["suv", "double_b", "suv_double_b", "specified"]);
+          draft.vehicle_request_type =
+            vehicle_request_type_hint && allowedVehicleTypes.has(vehicle_request_type_hint)
+              ? vehicle_request_type_hint
+              : "";
+          draft.fare_surcharge = draft.vehicle_request_type
+            ? vehicleTypeSurcharge(draft.vehicle_request_type)
             : 0;
-
-          if (vehicle_request_type_hint) {
-            draft.vehicle_request_type = vehicle_request_type_hint;
-            draft.fare_surcharge = vehicleTypeSurcharge(vehicle_request_type_hint);
-          } else if (!draft.vehicle_request_type) {
-            draft.fare_surcharge = 0;
-          } else {
-            draft.fare_surcharge = vehicleTypeSurcharge(draft.vehicle_request_type);
-          }
 
           // v0.5.0：加人費（超載準則）
           // 5座：基準4人，第5人+100；6座：基準5人，第6人+100；7座以上：基準6人，第7人起每多1人+100
@@ -912,6 +980,7 @@ export async function parseOrderFromText(messageText, options = {}) {
           }
           draft.estimated_fare_text = `${draft.estimated_fare_text}；加價+$${totalSurcharge}`;
 
+          reply = stripUnwarrantedVehicleSurchargeClaims(reply, draft.vehicle_request_type);
           reply = ensureSurchargeQuestionInReply(reply, draft.vehicle_request_type);
           reply = suppressAddressReaskWhenPickupVerified(reply, pickup_verified, draft);
           reply = finalizeCustomerFareReply(reply, draft.estimated_fare_text);
