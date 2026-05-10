@@ -780,10 +780,9 @@ async function handleEvent(event) {
       const pickupBlockReason = pickupEmptyBlockReason(merged.pickup);
       const effectivePickupVerified =
         Boolean(ai?.pickup_verified) && !pickupBlockReason && Boolean(merged.pickup?.trim());
-      const effectiveTimeClear =
-        Boolean(ai?.time_clear) &&
-        serverTimeLooksConcrete(merged.time) &&
-        Boolean(merged.time?.trim());
+      // 老闆直覺：只要 pickup_verified=true 且時間具體，即可發卡、可標記（不再被 AI 的 time_clear 卡死）。
+      // 嚴禁缺上車點時噴卡（pickupEmptyBlockReason 已擋）。
+      const effectiveTimeClear = serverTimeLooksConcrete(merged.time) && Boolean(merged.time?.trim());
 
       const driverReady =
         Boolean(ai) && effectivePickupVerified && effectiveTimeClear;
@@ -827,9 +826,22 @@ async function handleEvent(event) {
         );
         const customerMsg = [safeLead, finalBlock].filter(Boolean).join("\n\n");
 
-        // 已派出／已抵達：不開第二張單，只自然回覆並同步草稿（車資隨 KB 更新）
+        // 一單一卡：已標記成功（matched/arrived）後，乘客補齊或修改 → 不重噴整張卡。
+        // 改為通知司機變動內容，並用口語回乘客「已幫你通知司機」。
         if (activeForDispatch && activeForDispatch.status !== "waiting") {
           setDispatchDraft(userId, merged);
+          const diff = summarizeOrderChangesForDriver(activeForDispatch, merged);
+          if (activeForDispatch.status === "matched" && activeForDispatch.driverId && diff) {
+            await pushText(
+              DRIVER_GROUP_ID,
+              `@${activeForDispatch.driverId} 訂單${activeForDispatch.orderId}更新：${diff}`
+            );
+            const msg = "好的，已幫您通知司機。";
+            await reply(replyToken, msg);
+            appendConversationTurn(userId, "assistant", msg);
+            return;
+          }
+
           await reply(replyToken, safeLead);
           appendConversationTurn(userId, "assistant", safeLead);
           return;
@@ -860,10 +872,8 @@ async function handleEvent(event) {
           setDispatchDraft(userId, merged);
           await reply(replyToken, customerMsg);
           appendConversationTurn(userId, "assistant", customerMsg);
-          await pushText(
-            DRIVER_GROUP_ID,
-            `📋 訂單更新（${existingWaiting.orderId}）\n\n${finalBlock}`
-          );
+          // 一單一卡：waiting 狀態允許更新卡；matched 後改走「通知司機變動」。
+          await pushText(DRIVER_GROUP_ID, `📋 訂單更新（${existingWaiting.orderId}）\n\n${finalBlock}`);
           return;
         }
 
@@ -1304,6 +1314,30 @@ function applyMergedToWaitingOrder(order, merged, finalBlock) {
   order.estimatedRouteKm = merged.estimated_route_km ?? order.estimatedRouteKm;
   order.estimatedRouteFare = merged.estimated_route_fare ?? order.estimatedRouteFare;
   order.estimatedRouteSource = merged.estimated_route_source ?? order.estimatedRouteSource;
+}
+
+function summarizeOrderChangesForDriver(order, merged) {
+  const before = {
+    pickup: String(order.pickup || order.address || "").trim(),
+    dropoff: String(order.dropoff || "").trim(),
+    time: String(order.time || "").trim(),
+    date: String(order.date || "").trim(),
+    passengers: String(order.passengers || "").trim()
+  };
+  const after = {
+    pickup: String(merged.pickup ?? "").trim() || before.pickup,
+    dropoff: String(merged.dropoff ?? "").trim() || before.dropoff,
+    time: String(merged.time ?? "").trim() || before.time,
+    date: String(merged.date ?? "").trim() || before.date,
+    passengers: String(merged.passengers ?? "").trim() || before.passengers
+  };
+  const diffs = [];
+  if (before.pickup !== after.pickup) diffs.push(`上車→${after.pickup}`);
+  if (before.dropoff !== after.dropoff) diffs.push(`下車→${after.dropoff}`);
+  if (before.date !== after.date && after.date) diffs.push(`日期→${after.date}`);
+  if (before.time !== after.time && after.time) diffs.push(`時間→${after.time}`);
+  if (before.passengers !== after.passengers && after.passengers) diffs.push(`人數→${after.passengers}`);
+  return diffs.join("，");
 }
 
 function setUserState(userId, state, data = {}) {

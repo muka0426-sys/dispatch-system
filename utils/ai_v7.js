@@ -64,6 +64,7 @@ function buildSystemPrompt(
 - 資料尚未齊備時：像真人一樣一問一答引導，**不要**在 reply 內用「未提供」填滿假格式。
 - 只有在 pickup_verified 與 time_clear 皆 true、真的可派車時，才在語氣上暗示「我這邊幫你整理好了」；**不要**在 reply 內貼整段加速派車格式（卡片由系統在條件成立時附加）。
 - 行程或加價條件變動時，reply 裡的車資說明必須與 knowledge_base 定額／estimated_fare_text 邏輯一致，不可亂報價。
+- 一旦 pickup_verified=true 且 draft.pickup 非空：你必須把該上車點當作已核實的既定事實，**嚴禁**再問「請問哪一區／哪裡上車／是哪個縣市區」。若仍缺資料，只能追問缺的欄位（例如下車點或時間）。
 
 【回覆長度（強制）】
 - reply 全文字數（含標點）必須在 ${REPLY_TARGET_MIN}～${REPLY_MAX_CHARS} 字之間；能更短更好，絕對不可超過 ${REPLY_MAX_CHARS} 字。
@@ -251,6 +252,22 @@ export function alignCustomerReplyToEstimatedFare(reply, estimatedFareText) {
 
 export function finalizeCustomerFareReply(reply, estimatedFareText) {
   return ensureReplyLengthBand(alignCustomerReplyToEstimatedFare(reply, estimatedFareText));
+}
+
+function suppressAddressReaskWhenPickupVerified(reply, pickup_verified, draft) {
+  if (!pickup_verified) return String(reply ?? "").trim();
+  const pickup = String(draft?.pickup ?? "").trim();
+  if (!pickup) return String(reply ?? "").trim();
+  const t = String(reply ?? "").trim();
+  const reask =
+    /(哪一個區|哪個區|哪裡上車|上車在哪|在哪個縣市區|請補.*地址|補.*縣市區)/.test(t);
+  if (!reask) return t;
+  const missingDropoff = !String(draft?.dropoff ?? "").trim() || String(draft?.dropoff ?? "").trim() === "—";
+  const missingTime = !String(draft?.time ?? "").trim();
+  if (missingDropoff && missingTime) return "好的，上車點我記下了～再給我下車地點跟時間就行。";
+  if (missingDropoff) return "好的，上車點我記下了～下車要到哪裡呢？";
+  if (missingTime) return "好的，上車點我記下了～想幾點搭車呢？";
+  return "好的，上車點我記下了～我這邊幫你整理。";
 }
 
 function looksLikeFakeDriverNote(messageText) {
@@ -896,6 +913,7 @@ export async function parseOrderFromText(messageText, options = {}) {
           draft.estimated_fare_text = `${draft.estimated_fare_text}；加價+$${totalSurcharge}`;
 
           reply = ensureSurchargeQuestionInReply(reply, draft.vehicle_request_type);
+          reply = suppressAddressReaskWhenPickupVerified(reply, pickup_verified, draft);
           reply = finalizeCustomerFareReply(reply, draft.estimated_fare_text);
 
           return {
