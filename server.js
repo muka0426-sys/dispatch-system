@@ -115,6 +115,101 @@ function routeKey(pickup, dropoff) {
   return `${String(pickup ?? "").trim()} → ${String(dropoff ?? "").trim()}`;
 }
 
+function googleMapsApiKey() {
+  return String(process.env.MAPS_API_KEY ?? process.env.GOOGLE_MAPS_API_KEY ?? "").trim();
+}
+
+function isTaiwanGeocodeResult(result) {
+  const comps = Array.isArray(result?.address_components) ? result.address_components : [];
+  return comps.some((c) => c?.types?.includes("country") && c?.short_name === "TW");
+}
+
+function isSpecificGeocodeResult(result) {
+  if (!result || result.partial_match) return false;
+  if (!isTaiwanGeocodeResult(result)) return false;
+
+  const types = Array.isArray(result.types) ? result.types : [];
+  const allowedSpecificTypes = new Set([
+    "street_address",
+    "premise",
+    "subpremise",
+    "establishment",
+    "point_of_interest",
+    "transit_station",
+    "train_station",
+    "bus_station",
+    "airport",
+    "parking",
+    "hospital",
+    "school",
+    "store",
+    "restaurant",
+    "lodging",
+    "park"
+  ]);
+  if (types.some((t) => allowedSpecificTypes.has(t))) return true;
+
+  const genericOnlyTypes = new Set([
+    "political",
+    "country",
+    "administrative_area_level_1",
+    "administrative_area_level_2",
+    "administrative_area_level_3",
+    "locality",
+    "sublocality",
+    "sublocality_level_1",
+    "neighborhood",
+    "postal_code",
+    "route"
+  ]);
+  if (types.length && types.every((t) => genericOnlyTypes.has(t))) return false;
+
+  const locationType = String(result?.geometry?.location_type ?? "");
+  return locationType && locationType !== "APPROXIMATE";
+}
+
+async function verifyPickupAddressWithGoogleMaps(pickup) {
+  const address = String(pickup ?? "").trim();
+  if (!address) return { ok: false, reason: "empty" };
+
+  const key = googleMapsApiKey();
+  if (!key) {
+    console.error("[Maps Verify] Missing MAPS_API_KEY/GOOGLE_MAPS_API_KEY");
+    return { ok: false, reason: "missing_api_key" };
+  }
+
+  const url =
+    "https://maps.googleapis.com/maps/api/geocode/json" +
+    `?address=${encodeURIComponent(address)}` +
+    "&region=tw&language=zh-TW" +
+    `&key=${encodeURIComponent(key)}`;
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 6000);
+  try {
+    const res = await fetch(url, { signal: controller.signal });
+    if (!res.ok) return { ok: false, reason: `http_${res.status}` };
+    const data = await res.json();
+    const results = Array.isArray(data?.results) ? data.results : [];
+    const best = results.find((r) => isSpecificGeocodeResult(r));
+    if (!best) {
+      return { ok: false, reason: data?.status || "no_specific_result" };
+    }
+    return {
+      ok: true,
+      formatted_address: String(best.formatted_address ?? address).trim(),
+      place_id: String(best.place_id ?? "").trim(),
+      location: best.geometry?.location ?? null,
+      types: best.types || []
+    };
+  } catch (e) {
+    console.error("[Maps Verify]", e?.message || e);
+    return { ok: false, reason: "request_failed" };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 async function loadAlarmsDb() {
   try {
     await ensureJsonFile(ALARMS_DB_FILE);
@@ -134,7 +229,7 @@ async function loadAlarmsDb() {
 
 async function saveAlarmsDb() {
   const out = {
-    version: "0.7.10",
+    version: "0.7.11",
     alarms: alarmsDb.alarms || {},
     waiting_dispatches: alarmsDb.waiting_dispatches || {}
   };
@@ -840,14 +935,29 @@ async function handleEvent(event) {
       }
 
       const pickupBlockReason = pickupEmptyBlockReason(merged.pickup);
-      const effectivePickupVerified =
-        Boolean(ai?.pickup_verified) && !pickupBlockReason && Boolean(merged.pickup?.trim());
-      // v0.7.10 極速盲派：只要上車點核實，立刻建單並發唯一一次卡；不再等時間／下車點。
-
-      const driverReady = Boolean(ai) && effectivePickupVerified;
+      const hasPickupCandidate = !pickupBlockReason && Boolean(merged.pickup?.trim());
+      // v0.7.11：AI 只萃取上車文字；盲派前的最終可派判定必須由 Google Maps API 完成。
+      const driverReady = Boolean(ai?.ride_related) && hasPickupCandidate;
 
       if (driverReady) {
         const activeForDispatch = getActiveOrder(userId);
+
+        if (!activeForDispatch) {
+          const pickupVerify = await verifyPickupAddressWithGoogleMaps(merged.pickup);
+          if (!pickupVerify.ok) {
+            setDispatchDraft(userId, merged);
+            const msg = "不好意思，地圖上找不到這個地址，請問能提供更完整的位置或地標嗎？";
+            await reply(replyToken, msg);
+            appendConversationTurn(userId, "assistant", msg);
+            return;
+          }
+          merged = {
+            ...merged,
+            pickup: pickupVerify.formatted_address || merged.pickup,
+            pickup_place_id: pickupVerify.place_id || "",
+            pickup_verified_source: "google_maps"
+          };
+        }
 
         // 知識庫機場定額（與 isAirportRideIntent 對齊）；避免 AI 誤走里程公式時卡片車資不符。
         const kbAirportFlat = await estimateAirportFlatFareByKb({
@@ -1706,7 +1816,7 @@ function mergeDispatchDraft(base, patch) {
   return out;
 }
 
-/** 僅擋「完全沒有上車文字」；地址真偽一律交給 AI 以地圖／導航思維判斷 pickup_verified。 */
+/** 僅擋「完全沒有上車文字」；地址真偽由盲派前 Google Maps 驗證決定。 */
 function pickupEmptyBlockReason(pickup) {
   if (!String(pickup ?? "").trim()) return "缺少上車地址";
   return null;
