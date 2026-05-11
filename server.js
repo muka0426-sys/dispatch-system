@@ -134,7 +134,7 @@ async function loadAlarmsDb() {
 
 async function saveAlarmsDb() {
   const out = {
-    version: "0.7.8",
+    version: "0.7.10",
     alarms: alarmsDb.alarms || {},
     waiting_dispatches: alarmsDb.waiting_dispatches || {}
   };
@@ -154,6 +154,10 @@ async function persistDispatchSnapshot(order, merged, finalBlock) {
   order.date = forcedToday;
   const safeMerged = forceDispatchDraftToday(merged);
   const safeFinalBlock = forceDispatchBlockToday(finalBlock);
+  const lockedFinalBlock =
+    hasDispatchCardSent(order) && String(order.formText ?? "").trim()
+      ? forceDispatchBlockToday(order.formText)
+      : safeFinalBlock;
   alarmsDb.waiting_dispatches = alarmsDb.waiting_dispatches || {};
   alarmsDb.waiting_dispatches[order.orderId] = {
     orderId: order.orderId,
@@ -163,7 +167,9 @@ async function persistDispatchSnapshot(order, merged, finalBlock) {
     date: forcedToday,
     time: String(order.time ?? ""),
     estimated_fare_text: String(safeMerged.estimated_fare_text ?? ""),
-    finalBlock: safeFinalBlock,
+    finalBlock: lockedFinalBlock,
+    dispatchCardSent: Boolean(order.dispatchCardSent),
+    dispatchCardSentAtMs: order.dispatchCardSentAtMs ?? null,
     createdAtMs: order.createdAt,
     persistedAtMs: Date.now()
   };
@@ -469,11 +475,6 @@ async function handleEvent(event) {
 
         await reply(replyToken, "已標記，車卡我這邊直接噴。");
 
-        const dispatchBody = acceleratedDispatchBlockFromOrder(waitingOrder);
-        await pushText(DRIVER_GROUP_ID, wrapRsSpecialistDispatch(dispatchBody)).catch((e) =>
-          console.error("[push DRIVER_GROUP RS matched]", e?.message || e)
-        );
-
         await notifyCustomerDriverMatched(
           waitingOrder.customerId,
           leader.driverUserId,
@@ -548,11 +549,6 @@ async function handleEvent(event) {
         cardTargetOrder.driverEta = pending.time;
 
         await reply(replyToken, "已派你出發 🚗");
-
-        const dispatchBodyMatched = acceleratedDispatchBlockFromOrder(cardTargetOrder);
-        await pushText(DRIVER_GROUP_ID, wrapRsSpecialistDispatch(dispatchBodyMatched)).catch((e) =>
-          console.error("[push DRIVER_GROUP RS matched pending]", e?.message || e)
-        );
 
         await notifyCustomerDriverMatched(cardTargetOrder.customerId, userId, pending.time);
 
@@ -706,21 +702,8 @@ async function handleEvent(event) {
 
       const pendingDispatch = getPendingDispatchConfirmation(userId);
       if (pendingDispatch && isDispatchConfirmationText(text)) {
-        const order = orders.find(
-          (o) => o.orderId === pendingDispatch.orderId && o.customerId === userId
-        );
-        if (!order || order.status !== "waiting") {
-          clearPendingDispatchConfirmation(userId);
-          const msg = "這筆派單狀態已變更，我先不重送卡片。";
-          await reply(replyToken, msg);
-          appendConversationTurn(userId, "assistant", msg);
-          return;
-        }
-
-        const finalBlock = forceDispatchBlockToday(pendingDispatch.finalBlock);
-        await pushText(DRIVER_GROUP_ID, wrapRsSpecialistDispatch(finalBlock));
         clearPendingDispatchConfirmation(userId);
-        const msg = "好的，已為您派單給司機。";
+        const msg = "派車卡已鎖定，不會重複發送；資料我這邊已更新。";
         await reply(replyToken, msg);
         appendConversationTurn(userId, "assistant", msg);
         return;
@@ -748,15 +731,17 @@ async function handleEvent(event) {
           now: currentDateTime
         });
 
-        if (aiTime?.ride_timestamp) {
+        if (aiTime?.ride_timestamp || aiTime?.draft?.time) {
           const beforeTime = active.time || "";
           const nextDraft = forceDispatchDraftToday(
             mergeDispatchDraft(buildContextDraftForAi(userId), aiTime.draft)
           );
           if (nextDraft.time) active.time = nextDraft.time;
           active.date = todayYmdTaipei();
-          active.rideTimestamp = normalizeRideTimestampYearTo2026(aiTime.ride_timestamp);
-          active.rideTimestampMs = active.rideTimestamp ? Date.parse(active.rideTimestamp) : NaN;
+          if (aiTime?.ride_timestamp) {
+            active.rideTimestamp = normalizeRideTimestampYearTo2026(aiTime.ride_timestamp);
+            active.rideTimestampMs = active.rideTimestamp ? Date.parse(active.rideTimestamp) : NaN;
+          }
           if (Number.isFinite(active.rideTimestampMs) && active.isFake && active.date) {
             await scheduleFakeReservationAlert(active);
           }
@@ -765,7 +750,7 @@ async function handleEvent(event) {
 
           if (active.status === "waiting") {
             const finalBlock = buildAcceleratedDispatchFormat(nextDraft);
-            active.formText = finalBlock;
+            if (!hasDispatchCardSent(active)) active.formText = finalBlock;
             try {
               await persistDispatchSnapshot(active, nextDraft, finalBlock);
             } catch (e) {
@@ -776,13 +761,8 @@ async function handleEvent(event) {
               return;
             }
 
-            setPendingDispatchConfirmation(userId, {
-              orderId: active.orderId,
-              finalBlock,
-              reason: "modify_time",
-              diff: beforeTime && beforeTime !== active.time ? `時間→${active.time}` : ""
-            });
-            const msg = formatPendingDispatchConfirmReply(nextDraft, `時間→${active.time}`);
+            clearPendingDispatchConfirmation(userId);
+            const msg = "收到，時間已更新。";
             await reply(replyToken, msg);
             appendConversationTurn(userId, "assistant", msg);
             return;
@@ -790,7 +770,7 @@ async function handleEvent(event) {
 
           if ((active.status === "matched" || active.status === "arrived") && active.driverId && beforeTime !== active.time) {
             const dname = getDriverDisplayName(active.driverId);
-            await pushText(DRIVER_GROUP_ID, `【司機 ${dname}】客人更新：時間→${active.time}`);
+            await pushText(DRIVER_GROUP_ID, `@${dname} 客人更新資訊：時間改為${active.time}`);
             const msg = "好的，已幫您通知司機。";
             await reply(replyToken, msg);
             appendConversationTurn(userId, "assistant", msg);
@@ -832,7 +812,8 @@ async function handleEvent(event) {
         ai?.needs_admin_pricing &&
         process.env.ADMIN_GROUP_ID &&
         !ai.is_fake &&
-        Boolean(ai.pickup_verified)
+        Boolean(ai.pickup_verified) &&
+        !(Boolean(ai.pickup_verified) && !pickupEmptyBlockReason(merged.pickup) && Boolean(merged.pickup?.trim()))
       ) {
         const pickup = merged.pickup;
         const dropoff = merged.dropoff;
@@ -861,12 +842,9 @@ async function handleEvent(event) {
       const pickupBlockReason = pickupEmptyBlockReason(merged.pickup);
       const effectivePickupVerified =
         Boolean(ai?.pickup_verified) && !pickupBlockReason && Boolean(merged.pickup?.trim());
-      // 老闆直覺：只要 pickup_verified=true 且時間具體，即可發卡、可標記（不再被 AI 的 time_clear 卡死）。
-      // 嚴禁缺上車點時噴卡（pickupEmptyBlockReason 已擋）。
-      const effectiveTimeClear = serverTimeLooksConcrete(merged.time) && Boolean(merged.time?.trim());
+      // v0.7.10 極速盲派：只要上車點核實，立刻建單並發唯一一次卡；不再等時間／下車點。
 
-      const driverReady =
-        Boolean(ai) && effectivePickupVerified && effectiveTimeClear;
+      const driverReady = Boolean(ai) && effectivePickupVerified;
 
       if (driverReady) {
         const activeForDispatch = getActiveOrder(userId);
@@ -918,8 +896,6 @@ async function handleEvent(event) {
           return;
         }
 
-        const customerMsg = [safeLead, finalBlock].filter(Boolean).join("\n\n");
-
         // 一單一卡：已標記成功（matched/arrived）後，乘客補齊或修改 → 不重噴整張卡。
         // 改為通知司機變動內容，並用口語回乘客「已幫你通知司機」。
         if (activeForDispatch && activeForDispatch.status !== "waiting") {
@@ -934,7 +910,7 @@ async function handleEvent(event) {
             const dname = getDriverDisplayName(activeForDispatch.driverId);
             await pushText(
               DRIVER_GROUP_ID,
-              `【司機 ${dname}】客人更新：${diff}`
+              `@${dname} 客人更新資訊：${diff}`
             );
             const msg = "好的，已幫您通知司機。";
             await reply(replyToken, msg);
@@ -972,15 +948,10 @@ async function handleEvent(event) {
 
           setDispatchDraft(userId, merged);
           if (updateDiff) {
-            setPendingDispatchConfirmation(userId, {
-              orderId: existingWaiting.orderId,
-              finalBlock,
-              reason: "modify_order",
-              diff: updateDiff
-            });
-            const confirmMsg = formatPendingDispatchConfirmReply(merged, updateDiff);
-            await reply(replyToken, confirmMsg);
-            appendConversationTurn(userId, "assistant", confirmMsg);
+            clearPendingDispatchConfirmation(userId);
+            const msg = "收到，資料已更新。";
+            await reply(replyToken, msg);
+            appendConversationTurn(userId, "assistant", msg);
             return;
           }
 
@@ -1012,9 +983,19 @@ async function handleEvent(event) {
         clearPendingDispatchConfirmation(userId);
         setUserState(userId, "waiting_dispatch", { orderId: order.orderId });
 
-        await reply(replyToken, customerMsg);
-        appendConversationTurn(userId, "assistant", customerMsg);
-        await pushText(DRIVER_GROUP_ID, wrapRsSpecialistDispatch(finalBlock));
+        try {
+          await pushDispatchCardOnce(order, merged, finalBlock);
+        } catch (e) {
+          console.error("[pushDispatchCardOnce]", e?.message || e);
+          const failMsg = "系統派單發送失敗，請稍後再試。";
+          await reply(replyToken, failMsg);
+          appendConversationTurn(userId, "assistant", failMsg);
+          return;
+        }
+
+        const blindDispatchMsg = "收到，已為您派車。請問下車地點是哪裡？";
+        await reply(replyToken, blindDispatchMsg);
+        appendConversationTurn(userId, "assistant", blindDispatchMsg);
         return;
       }
 
@@ -1313,7 +1294,9 @@ function createOrder(customerId, form) {
     fakeAlertTimer: null,
     createdAt: Date.now(),
     driverId: null,
-    driverEta: null
+    driverEta: null,
+    dispatchCardSent: false,
+    dispatchCardSentAtMs: null
   };
   orders.push(newOrder);
   return newOrder;
@@ -1351,13 +1334,27 @@ function forceDispatchBlockToday(block) {
   return s;
 }
 
-function setPendingDispatchConfirmation(userId, payload) {
-  setUserState(userId, getUserState(userId), {
-    pendingDispatchConfirmation: {
-      ...(payload || {}),
-      createdAtMs: Date.now()
-    }
-  });
+function hasDispatchCardSent(order) {
+  if (!order) return false;
+  if (order.dispatchCardSent === true || order.dispatchCardSentAtMs) return true;
+  const hasExplicitFlag =
+    Object.prototype.hasOwnProperty.call(order, "dispatchCardSent") ||
+    Object.prototype.hasOwnProperty.call(order, "dispatchCardSentAtMs");
+  // 舊記憶體訂單沒有 flag，但 formText 已有派車卡時，保守視為已發送，避免重噴。
+  if (!hasExplicitFlag && String(order.formText ?? "").includes("加速派車格式")) return true;
+  return false;
+}
+
+async function pushDispatchCardOnce(order, merged, finalBlock) {
+  if (hasDispatchCardSent(order)) return false;
+  const safeMerged = forceDispatchDraftToday(merged);
+  const safeFinalBlock = forceDispatchBlockToday(finalBlock);
+  order.dispatchCardSent = true;
+  order.dispatchCardSentAtMs = Date.now();
+  order.formText = safeFinalBlock;
+  await persistDispatchSnapshot(order, safeMerged, safeFinalBlock);
+  await pushText(DRIVER_GROUP_ID, wrapRsSpecialistDispatch(safeFinalBlock));
+  return true;
 }
 
 function getPendingDispatchConfirmation(userId) {
@@ -1375,18 +1372,6 @@ function isDispatchConfirmationText(text) {
   const t = String(text ?? "").trim();
   if (!t) return false;
   return /^(好|好的|對|對的|是|是的|沒錯|確認|可以|可|派|派吧|發|發送|送出|送吧|請派|確定|ok|OK)$/i.test(t);
-}
-
-function formatPendingDispatchConfirmReply(merged, diff = "") {
-  const time = String(merged?.time ?? "").trim();
-  const changed = String(diff ?? "").trim();
-  if (time) {
-    return `已幫您將時間更改為 ${time}，請問確認要現在發送派車單嗎？`;
-  }
-  if (changed) {
-    return `已幫您更新${changed}，請問確認要現在發送派車單嗎？`;
-  }
-  return "已幫您更新資料，請問確認要現在發送派車單嗎？";
 }
 
 function orderBookingYmd(order) {
@@ -1599,7 +1584,9 @@ function applyMergedToWaitingOrder(order, merged, finalBlock) {
   order.time = String(merged.time ?? "").trim() || order.time;
   order.date = safeMerged.date;
   order.passengers = merged.passengers || order.passengers;
-  order.formText = forceDispatchBlockToday(finalBlock);
+  if (!hasDispatchCardSent(order)) {
+    order.formText = forceDispatchBlockToday(finalBlock);
+  }
   order.estimatedRouteKm = merged.estimated_route_km ?? order.estimatedRouteKm;
   order.estimatedRouteFare = merged.estimated_route_fare ?? order.estimatedRouteFare;
   order.estimatedRouteSource = merged.estimated_route_source ?? order.estimatedRouteSource;
