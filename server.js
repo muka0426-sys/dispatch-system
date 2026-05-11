@@ -169,6 +169,8 @@ function isSpecificGeocodeResult(result) {
 }
 
 async function verifyPickupAddressWithGoogleMaps(pickup) {
+  // [CRITICAL] 嚴禁移除或繞過此 Google Maps 驗證邏輯。
+  // 所有極速盲派完整派車卡都必須先通過此函式確認地址存在且夠明確。
   const address = String(pickup ?? "").trim();
   if (!address) return { ok: false, reason: "empty" };
 
@@ -248,7 +250,7 @@ async function persistDispatchSnapshot(order, merged, finalBlock) {
   const forcedToday = todayYmdTaipei();
   order.date = forcedToday;
   const safeMerged = forceDispatchDraftToday(merged);
-  const safeFinalBlock = forceDispatchBlockToday(finalBlock);
+  const safeFinalBlock = forceDispatchBlockToday(buildAcceleratedDispatchFormat(safeMerged));
   const lockedFinalBlock =
     hasDispatchCardSent(order) && String(order.formText ?? "").trim()
       ? forceDispatchBlockToday(order.formText)
@@ -943,10 +945,11 @@ async function handleEvent(event) {
         const activeForDispatch = getActiveOrder(userId);
 
         if (!activeForDispatch) {
+          // [CRITICAL] 嚴禁移除或繞過此 Google Maps 驗證邏輯。
           const pickupVerify = await verifyPickupAddressWithGoogleMaps(merged.pickup);
           if (!pickupVerify.ok) {
             setDispatchDraft(userId, merged);
-            const msg = "不好意思，地圖上找不到這個地址，請問能提供更完整的位置或地標嗎？";
+            const msg = "不好意思，地圖上找不到這個地址，請提供更精確的門牌或地標。";
             await reply(replyToken, msg);
             appendConversationTurn(userId, "assistant", msg);
             return;
@@ -955,6 +958,7 @@ async function handleEvent(event) {
             ...merged,
             pickup: pickupVerify.formatted_address || merged.pickup,
             pickup_place_id: pickupVerify.place_id || "",
+            pickup_verified: true,
             pickup_verified_source: "google_maps"
           };
         }
@@ -1097,6 +1101,13 @@ async function handleEvent(event) {
           await pushDispatchCardOnce(order, merged, finalBlock);
         } catch (e) {
           console.error("[pushDispatchCardOnce]", e?.message || e);
+          if (String(e?.message ?? "").startsWith("pickup_google_maps_verify_failed")) {
+            removeOrderById(order.orderId);
+            const msg = "不好意思，地圖上找不到這個地址，請提供更精確的門牌或地標。";
+            await reply(replyToken, msg);
+            appendConversationTurn(userId, "assistant", msg);
+            return;
+          }
           const failMsg = "系統派單發送失敗，請稍後再試。";
           await reply(replyToken, failMsg);
           appendConversationTurn(userId, "assistant", failMsg);
@@ -1457,7 +1468,22 @@ function hasDispatchCardSent(order) {
 
 async function pushDispatchCardOnce(order, merged, finalBlock) {
   if (hasDispatchCardSent(order)) return false;
-  const safeMerged = forceDispatchDraftToday(merged);
+  let safeMerged = forceDispatchDraftToday(merged);
+  // [CRITICAL] 嚴禁移除或繞過此 Google Maps 驗證邏輯。
+  // 這是完整派車卡送往司機群前的最後攔截器，AI 的 pickup_verified 不可作為放行依據。
+  if (safeMerged.pickup_verified_source !== "google_maps") {
+    const pickupVerify = await verifyPickupAddressWithGoogleMaps(safeMerged.pickup);
+    if (!pickupVerify.ok) {
+      throw new Error(`pickup_google_maps_verify_failed:${pickupVerify.reason || "unknown"}`);
+    }
+    safeMerged = {
+      ...safeMerged,
+      pickup: pickupVerify.formatted_address || safeMerged.pickup,
+      pickup_place_id: pickupVerify.place_id || "",
+      pickup_verified: true,
+      pickup_verified_source: "google_maps"
+    };
+  }
   const safeFinalBlock = forceDispatchBlockToday(finalBlock);
   order.dispatchCardSent = true;
   order.dispatchCardSentAtMs = Date.now();
