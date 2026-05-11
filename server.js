@@ -134,7 +134,7 @@ async function loadAlarmsDb() {
 
 async function saveAlarmsDb() {
   const out = {
-    version: "0.7.3",
+    version: "0.7.8",
     alarms: alarmsDb.alarms || {},
     waiting_dispatches: alarmsDb.waiting_dispatches || {}
   };
@@ -150,16 +150,20 @@ async function upsertAlarmRecord(record) {
 /** 派單廣播前強制持久化；失敗則不可對司機群發送格式。 */
 async function persistDispatchSnapshot(order, merged, finalBlock) {
   await loadAlarmsDb();
+  const forcedToday = todayYmdTaipei();
+  order.date = forcedToday;
+  const safeMerged = forceDispatchDraftToday(merged);
+  const safeFinalBlock = forceDispatchBlockToday(finalBlock);
   alarmsDb.waiting_dispatches = alarmsDb.waiting_dispatches || {};
   alarmsDb.waiting_dispatches[order.orderId] = {
     orderId: order.orderId,
     customerId: order.customerId,
     pickup: String(order.pickup ?? ""),
     dropoff: String(order.dropoff ?? ""),
-    date: order.date ?? null,
+    date: forcedToday,
     time: String(order.time ?? ""),
-    estimated_fare_text: String(merged.estimated_fare_text ?? ""),
-    finalBlock,
+    estimated_fare_text: String(safeMerged.estimated_fare_text ?? ""),
+    finalBlock: safeFinalBlock,
     createdAtMs: order.createdAt,
     persistedAtMs: Date.now()
   };
@@ -692,12 +696,35 @@ async function handleEvent(event) {
         clearAlarmByCustomer(userId);
         deleteOrderByCustomer(userId);
         clearDispatchDraft(userId);
+        clearPendingDispatchConfirmation(userId);
         setUserState(userId, "idle", { conversationLog: [] });
         await reply(replyToken, "已取消訂單");
         return;
       }
 
       appendConversationTurn(userId, "user", text);
+
+      const pendingDispatch = getPendingDispatchConfirmation(userId);
+      if (pendingDispatch && isDispatchConfirmationText(text)) {
+        const order = orders.find(
+          (o) => o.orderId === pendingDispatch.orderId && o.customerId === userId
+        );
+        if (!order || order.status !== "waiting") {
+          clearPendingDispatchConfirmation(userId);
+          const msg = "這筆派單狀態已變更，我先不重送卡片。";
+          await reply(replyToken, msg);
+          appendConversationTurn(userId, "assistant", msg);
+          return;
+        }
+
+        const finalBlock = forceDispatchBlockToday(pendingDispatch.finalBlock);
+        await pushText(DRIVER_GROUP_ID, wrapRsSpecialistDispatch(finalBlock));
+        clearPendingDispatchConfirmation(userId);
+        const msg = "好的，已為您派單給司機。";
+        await reply(replyToken, msg);
+        appendConversationTurn(userId, "assistant", msg);
+        return;
+      }
 
       // v0.3.2：修改時間意圖 → 清除舊 alarm，更新 rideTimestamp 後重設 alarm
       const modifyTimeIntent =
@@ -722,11 +749,54 @@ async function handleEvent(event) {
         });
 
         if (aiTime?.ride_timestamp) {
+          const beforeTime = active.time || "";
+          const nextDraft = forceDispatchDraftToday(
+            mergeDispatchDraft(buildContextDraftForAi(userId), aiTime.draft)
+          );
+          if (nextDraft.time) active.time = nextDraft.time;
+          active.date = todayYmdTaipei();
           active.rideTimestamp = normalizeRideTimestampYearTo2026(aiTime.ride_timestamp);
           active.rideTimestampMs = active.rideTimestamp ? Date.parse(active.rideTimestamp) : NaN;
           if (Number.isFinite(active.rideTimestampMs) && active.isFake && active.date) {
             await scheduleFakeReservationAlert(active);
           }
+
+          setDispatchDraft(userId, nextDraft);
+
+          if (active.status === "waiting") {
+            const finalBlock = buildAcceleratedDispatchFormat(nextDraft);
+            active.formText = finalBlock;
+            try {
+              await persistDispatchSnapshot(active, nextDraft, finalBlock);
+            } catch (e) {
+              console.error("[persistDispatchSnapshot]", e?.message || e);
+              const failMsg = "系統存檔失敗，更新未送出，請稍後再試。";
+              await reply(replyToken, failMsg);
+              appendConversationTurn(userId, "assistant", failMsg);
+              return;
+            }
+
+            setPendingDispatchConfirmation(userId, {
+              orderId: active.orderId,
+              finalBlock,
+              reason: "modify_time",
+              diff: beforeTime && beforeTime !== active.time ? `時間→${active.time}` : ""
+            });
+            const msg = formatPendingDispatchConfirmReply(nextDraft, `時間→${active.time}`);
+            await reply(replyToken, msg);
+            appendConversationTurn(userId, "assistant", msg);
+            return;
+          }
+
+          if ((active.status === "matched" || active.status === "arrived") && active.driverId && beforeTime !== active.time) {
+            const dname = getDriverDisplayName(active.driverId);
+            await pushText(DRIVER_GROUP_ID, `【司機 ${dname}】客人更新：時間→${active.time}`);
+            const msg = "好的，已幫您通知司機。";
+            await reply(replyToken, msg);
+            appendConversationTurn(userId, "assistant", msg);
+            return;
+          }
+
           const msg = "收到，時間已更新。";
           await reply(replyToken, msg);
           appendConversationTurn(userId, "assistant", msg);
@@ -830,6 +900,7 @@ async function handleEvent(event) {
           merged = { ...merged, estimated_route_km: null, estimated_route_fare: null, estimated_route_source: null };
         }
 
+        merged = forceDispatchDraftToday(merged);
         const finalBlock = buildAcceleratedDispatchFormat(merged);
         const safeLead = finalizeCustomerFareReply(
           stripDispatchMisleadingPhrases(ai.reply),
@@ -881,6 +952,7 @@ async function handleEvent(event) {
         );
 
         if (existingWaiting) {
+          const updateDiff = summarizeOrderChangesForDriver(existingWaiting, merged);
           applyMergedToWaitingOrder(existingWaiting, merged, finalBlock);
           if (ai?.ride_timestamp) {
             const n = normalizeRideTimestampYearTo2026(ai.ride_timestamp);
@@ -899,13 +971,21 @@ async function handleEvent(event) {
           }
 
           setDispatchDraft(userId, merged);
-          await reply(replyToken, customerMsg);
-          appendConversationTurn(userId, "assistant", customerMsg);
-          // 一單一卡：waiting 狀態允許更新卡；matched 後改走「通知司機變動」。
-          await pushText(
-            DRIVER_GROUP_ID,
-            wrapRsSpecialistDispatch(`📋 訂單更新（${existingWaiting.orderId}）\n\n${finalBlock}`)
-          );
+          if (updateDiff) {
+            setPendingDispatchConfirmation(userId, {
+              orderId: existingWaiting.orderId,
+              finalBlock,
+              reason: "modify_order",
+              diff: updateDiff
+            });
+            const confirmMsg = formatPendingDispatchConfirmReply(merged, updateDiff);
+            await reply(replyToken, confirmMsg);
+            appendConversationTurn(userId, "assistant", confirmMsg);
+            return;
+          }
+
+          await reply(replyToken, safeLead);
+          appendConversationTurn(userId, "assistant", safeLead);
           return;
         }
 
@@ -929,6 +1009,7 @@ async function handleEvent(event) {
         }
 
         clearDispatchDraft(userId);
+        clearPendingDispatchConfirmation(userId);
         setUserState(userId, "waiting_dispatch", { orderId: order.orderId });
 
         await reply(replyToken, customerMsg);
@@ -1211,6 +1292,7 @@ function createOrderId() {
 function createOrder(customerId, form) {
   const orderId = createOrderId();
   const normalizedRideTimestamp = normalizeRideTimestampYearTo2026(form.ride_timestamp);
+  const forcedToday = todayYmdTaipei();
   const newOrder = {
     orderId,
     status: "waiting",
@@ -1218,7 +1300,7 @@ function createOrder(customerId, form) {
     address: form.pickup,
     pickup: form.pickup,
     dropoff: form.dropoff,
-    date: form.date || null,
+    date: forcedToday,
     time: form.time,
     passengers: form.passengers || null,
     formText: form.rawText,
@@ -1255,6 +1337,56 @@ function todayYmdTaipei(d = new Date()) {
     month: "2-digit",
     day: "2-digit"
   }).format(d);
+}
+
+function forceDispatchDraftToday(draft) {
+  return { ...(draft || {}), date: todayYmdTaipei() };
+}
+
+function forceDispatchBlockToday(block) {
+  const today = todayYmdTaipei();
+  const s = String(block ?? "");
+  if (!s.trim()) return s;
+  if (/日期：.*/.test(s)) return s.replace(/日期：.*/g, `日期：${today}`);
+  return s;
+}
+
+function setPendingDispatchConfirmation(userId, payload) {
+  setUserState(userId, getUserState(userId), {
+    pendingDispatchConfirmation: {
+      ...(payload || {}),
+      createdAtMs: Date.now()
+    }
+  });
+}
+
+function getPendingDispatchConfirmation(userId) {
+  const p = users[userId]?.pendingDispatchConfirmation;
+  if (!p || typeof p !== "object") return null;
+  return p;
+}
+
+function clearPendingDispatchConfirmation(userId) {
+  if (!users[userId]) return;
+  delete users[userId].pendingDispatchConfirmation;
+}
+
+function isDispatchConfirmationText(text) {
+  const t = String(text ?? "").trim();
+  if (!t) return false;
+  return /^(好|好的|對|對的|是|是的|沒錯|確認|可以|可|派|派吧|發|發送|送出|送吧|請派|確定|ok|OK)$/i.test(t);
+}
+
+function formatPendingDispatchConfirmReply(merged, diff = "") {
+  const time = String(merged?.time ?? "").trim();
+  const changed = String(diff ?? "").trim();
+  if (time) {
+    return `已幫您將時間更改為 ${time}，請問確認要現在發送派車單嗎？`;
+  }
+  if (changed) {
+    return `已幫您更新${changed}，請問確認要現在發送派車單嗎？`;
+  }
+  return "已幫您更新資料，請問確認要現在發送派車單嗎？";
 }
 
 function orderBookingYmd(order) {
@@ -1437,7 +1569,7 @@ function buildContextDraftForAi(userId) {
   const active = getActiveOrder(userId);
   if (!active) return prev;
   return mergeDispatchDraft(prev, {
-    date: String(active.date ?? prev.date ?? "").trim(),
+    date: todayYmdTaipei(),
     time: String(active.time ?? prev.time ?? "").trim(),
     pickup: String(active.pickup || active.address || prev.pickup || "").trim(),
     dropoff: String(active.dropoff ?? prev.dropoff ?? "").trim(),
@@ -1454,19 +1586,20 @@ function buildActiveOrderContextForAi(userId) {
     pickup: active.pickup || active.address || "",
     dropoff: active.dropoff || "",
     time: active.time || "",
-    date: active.date || "",
+    date: todayYmdTaipei(),
     passengers: active.passengers || ""
   };
 }
 
 function applyMergedToWaitingOrder(order, merged, finalBlock) {
+  const safeMerged = forceDispatchDraftToday(merged);
   order.pickup = String(merged.pickup ?? "").trim();
   order.address = order.pickup;
   order.dropoff = String(merged.dropoff ?? "").trim() || order.dropoff;
   order.time = String(merged.time ?? "").trim() || order.time;
-  order.date = merged.date || order.date;
+  order.date = safeMerged.date;
   order.passengers = merged.passengers || order.passengers;
-  order.formText = finalBlock;
+  order.formText = forceDispatchBlockToday(finalBlock);
   order.estimatedRouteKm = merged.estimated_route_km ?? order.estimatedRouteKm;
   order.estimatedRouteFare = merged.estimated_route_fare ?? order.estimatedRouteFare;
   order.estimatedRouteSource = merged.estimated_route_source ?? order.estimatedRouteSource;
@@ -1514,7 +1647,7 @@ function getDispatchDraft(userId) {
   const d = users[userId]?.dispatchDraft;
   if (!d || typeof d !== "object") {
     return {
-      date: "",
+      date: todayYmdTaipei(),
       time: "",
       pickup: "",
       dropoff: "",
@@ -1530,7 +1663,7 @@ function getDispatchDraft(userId) {
     };
   }
   return {
-    date: String(d.date ?? "").trim(),
+    date: todayYmdTaipei(),
     time: String(d.time ?? "").trim(),
     pickup: String(d.pickup ?? "").trim(),
     dropoff: String(d.dropoff ?? "").trim(),
@@ -1547,7 +1680,7 @@ function getDispatchDraft(userId) {
 }
 
 function setDispatchDraft(userId, draft) {
-  setUserState(userId, getUserState(userId), { dispatchDraft: draft });
+  setUserState(userId, getUserState(userId), { dispatchDraft: forceDispatchDraftToday(draft) });
 }
 
 function clearDispatchDraft(userId) {
@@ -1647,6 +1780,7 @@ function displayDispatchField(v) {
 }
 
 function buildAcceleratedDispatchFormat(d) {
+  const forcedToday = todayYmdTaipei();
   const surcharge = Number(d.fare_surcharge ?? 0) || 0;
   const vtype = String(d.vehicle_request_type ?? "").trim();
   const vLabel = vtype === "suv" ? "休旅" : vtype === "double_b" ? "雙B" : vtype === "suv_double_b" ? "休旅/雙B" : "";
@@ -1660,7 +1794,7 @@ function buildAcceleratedDispatchFormat(d) {
   const needLine = `車型/需求：${vLabel || "一般"}`;
   return `❤️‍🔥加速派車格式❤️‍🔥
 
-日期：${displayDispatchField(d.date)}
+日期：${displayDispatchField(forcedToday)}
 時間：${displayDispatchField(d.time)}
 上車：${displayDispatchField(d.pickup)}
 下車：${displayDispatchField(d.dropoff)}
@@ -1672,10 +1806,11 @@ ${surchargeLine}`;
 }
 
 function draftToRideForm(d, rawText) {
+  const safeDraft = forceDispatchDraftToday(d);
   const pickup = String(d.pickup ?? "").trim();
   const time = String(d.time ?? "").trim();
   const dropoff = String(d.dropoff ?? "").trim();
-  const date = String(d.date ?? "").trim();
+  const date = String(safeDraft.date ?? "").trim();
   const passengers = String(d.passengers ?? "").trim();
   const vehicle_request_type = String(d.vehicle_request_type ?? "").trim();
   const fare_surcharge = Number(d.fare_surcharge ?? 0) || 0;
@@ -1699,7 +1834,7 @@ function draftToRideForm(d, rawText) {
     estimated_route_source,
     is_fake,
     ride_timestamp,
-    rawText
+    rawText: forceDispatchBlockToday(rawText)
   };
 }
 
