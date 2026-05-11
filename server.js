@@ -119,6 +119,22 @@ function googleMapsApiKey() {
   return String(process.env.MAPS_API_KEY ?? process.env.GOOGLE_MAPS_API_KEY ?? "").trim();
 }
 
+function sanitizePickupAddressForMaps(pickup) {
+  let s = String(pickup ?? "").trim();
+  if (!s) return "";
+
+  s = s
+    .replace(/[（(][^()（）]*[）)]/g, " ")
+    .replace(/❤️‍🔥加速派車格式❤️‍🔥[\s\S]*/g, " ")
+    .replace(/^(上車|地址|地點|位置|pickup)\s*[:：]\s*/i, "")
+    .replace(/(我要叫車|要叫車|叫車|幫我叫車|幫我派車|派車|上車在|我在|人在|從|出發|附近|旁邊|旁|門口|這邊)/g, " ")
+    .replace(/(麻煩|謝謝|謝啦|可以嗎|可以|幫忙|請問|請|喔|哦|啦|啊|～|~)/g, " ")
+    .replace(/[，,。！!？?；;]+/g, " ")
+    .replace(/\s+/g, "");
+
+  return s;
+}
+
 function isTaiwanGeocodeResult(result) {
   const comps = Array.isArray(result?.address_components) ? result.address_components : [];
   return comps.some((c) => c?.types?.includes("country") && c?.short_name === "TW");
@@ -127,6 +143,10 @@ function isTaiwanGeocodeResult(result) {
 function isSpecificGeocodeResult(result) {
   if (!result || result.partial_match) return false;
   if (!isTaiwanGeocodeResult(result)) return false;
+  const loc = result?.geometry?.location;
+  const lat = Number(loc?.lat);
+  const lng = Number(loc?.lng);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return false;
 
   const types = Array.isArray(result.types) ? result.types : [];
   const allowedSpecificTypes = new Set([
@@ -171,8 +191,10 @@ function isSpecificGeocodeResult(result) {
 async function verifyPickupAddressWithGoogleMaps(pickup) {
   // [CRITICAL] 嚴禁移除或繞過此 Google Maps 驗證邏輯。
   // 所有極速盲派完整派車卡都必須先通過此函式確認地址存在且夠明確。
-  const address = String(pickup ?? "").trim();
+  const address = sanitizePickupAddressForMaps(pickup);
+  console.log(`[MAP_DEBUG] 送往驗證的地址字串：${address}`);
   if (!address) return { ok: false, reason: "empty" };
+  if (/^\d{1,5}$/.test(address)) return { ok: false, reason: "number_only" };
 
   const key = googleMapsApiKey();
   if (!key) {
@@ -192,6 +214,9 @@ async function verifyPickupAddressWithGoogleMaps(pickup) {
     const res = await fetch(url, { signal: controller.signal });
     if (!res.ok) return { ok: false, reason: `http_${res.status}` };
     const data = await res.json();
+    if (data?.status !== "OK") {
+      return { ok: false, reason: data?.status || "not_ok" };
+    }
     const results = Array.isArray(data?.results) ? data.results : [];
     const best = results.find((r) => isSpecificGeocodeResult(r));
     if (!best) {
