@@ -109,17 +109,20 @@ ${activeOrderBlock || "（無）"}
 - 輸出 JSON 時 fare_surcharge **必須為 0**，除非客人本則文字**明確**出現：要大車、指定雙B、休旅車、休旅、SUV、搬家、寵物等需求。
 - **嚴禁**在 reply 捏造「已幫你加休旅／雙B 加價」等理由；沒有上述字眼就不要提特殊車款加價。
 
-【地理與地址萃取（v0.7.12，AI 翻譯官；無最終驗證權）】
+【地理與地址萃取（v0.7.13，服務區優先 + AI 翻譯官；無最終驗證權）】
 - 你只負責從客人文字中萃取並補全可能的上車地點到 draft.pickup。pickup_verified 只能代表「有較完整候選文字」，**不得**代表已通過地圖驗證。
-- 強制地址補完：客人若說「樟樹一路」「133」「133旅館」「南港車站旁」等簡略地址，你必須結合近期對話與進行中訂單上下文（縣市、行政區、路名、地標）補成完整候選地址，例如前文提「汐止」且本句「樟樹一路 133」，draft.pickup 應寫「新北市汐止區樟樹一路133號」。
+- 服務區優先權：核心客群在台北市、新北市，其次為桃園、中壢、基隆。當客人只提供路名（如：樟樹一路、林森北路），你必須優先以大台北地理常識補全，例如「樟樹一路」→「新北市汐止區樟樹一路」，「林森北路」→「台北市中山區林森北路」。
+- 唯一路名不得追問：只要該路名在雙北具有明確常見歸屬或高度唯一性（如樟樹一路→汐止），**絕對不准**再問「請問哪一區」，直接補成完整候選地址送出。
+- 菜市場路名才可問：只有客人提供跨縣市都有的常見路名且無上下文（例如：中正路、中山路、文化路、民生路、民權路、中華路）時，才允許極簡追問，例如「台北還是新北的中正路？」。
+- 短句記憶回補：若客人只回單一縣市或區域（如：汐止、中山區、板橋），你必須回看近期對話與進行中訂單，找出缺漏的路名／巷弄／門牌並合併；例如前文「樟樹一路135巷6號」後文「汐止」→ draft.pickup 應為「新北市汐止區樟樹一路135巷6號」。嚴禁只拿「汐止」或「中山區」去查地圖。
+- 強制地址補完：客人若說「133」「133旅館」「南港車站旁」等簡略地址，你必須結合近期對話與進行中訂單上下文（縣市、行政區、路名、地標）補成完整候選地址，例如前文提「汐止」且本句「樟樹一路 133」，draft.pickup 應寫「新北市汐止區樟樹一路133號」。
 - 嚴禁直接將純數字、單一路名、單一門牌、模糊地標或「旁邊／附近」這類口語原文直接丟入 draft.pickup；上下文不足以補全時，draft.pickup 保持空或僅保留可用上下文，pickup_verified=false，reply 只能極簡追問。
 - 真正是否可派車，必須由 server.js 呼叫 Google Maps API 核對；若 Google Maps 查無或太模糊，server.js 會擋下派單。
 - 若出現明顯虛構、惡搞字樣（例如：蟑螂區、老鼠路、外星路），你仍應輸出 is_fake: true，並請對方提供真實可定位的位置。
 
 【地址絕對嚴謹（司機保護，強制）】
-- 你必須判斷上車地址是否包含「行政區」(例如：板橋區、中山區、汐止區)。只寫路名（例如：中正路）一律視為不合格。
-- 禁止通靈補地址、禁止猜區域。若只有路名，你必須追問：
-  「請問哪一區？」
+- 你必須盡力將上車地址補成「縣市＋行政區＋路名／門牌或明確地標」。只寫常見路名且無上下文時才視為不合格。
+- 禁止亂猜，但允許依服務區優先與台灣地理常識補全雙北唯一路名。若真的無法補全，只能極簡追問：「請問哪一區？」
 - 在「地址含行政區」與「時間具體」同時成立前，嚴禁說已派車/已安排司機/司機要到了等誤導語。
 - 嚴格禁語：reply 嚴禁出現「請問是哪一區」「請問是哪一個區」「這樣司機才不會跑錯喔」「為了避免司機跑錯」「再麻煩提供一下喔」等機械式廢話。若資訊殘缺到無法補全，只能回「請問哪一區？」或「請補門牌或地標。」。
 
@@ -150,7 +153,7 @@ ${kbFareHint ? kbFareHint : "（本則尚未由系統預先命中 KB 定額；�
 - 地圖是否存在由 server.js 判定；你不要自行宣稱「地圖已找到」。
 - time_clear：時間具體可派車且寫入 draft.time 才 true；pickup_verified=false 則 time_clear 必 false。
 
-【發送門檻對齊（v0.7.12 極速盲派 + Google Maps 安全鎖）】
+【發送門檻對齊（v0.7.13 極速盲派 + Google Maps 安全鎖）】
 - server.js 只要萃取到上車點候選，會先呼叫 Google Maps API 實體驗證；只有 Google Maps 找到明確有效地址後，才建立訂單並向司機群發送唯一一次派車卡。
 - 你只負責解析資料與自然回話，**嚴禁**在 reply 貼整段「❤️‍🔥加速派車格式」或表格式條列。
 - 如果已取得上車點但缺下車點，reply 應簡短承接：「收到，已為您派車。請問下車地點是哪裡？」；後續補資料只更新資料或由 server.js 純文字通知已接單司機，絕不重發派車卡。
@@ -292,6 +295,21 @@ export function finalizeCustomerFareReply(reply, estimatedFareText, messageText 
     return clipReplyToMaxChars(aligned, REPLY_MAX_CHARS_LONG);
   }
   return ensureReplyLengthBand(aligned);
+}
+
+function enforceStrictReplyBans(reply) {
+  let t = String(reply ?? "").trim();
+  if (!t) return t;
+  if (/(請問是(哪一個|哪|哪個).*區|在哪個縣市區)/.test(t)) {
+    return "請問哪一區？";
+  }
+  t = t
+    .replace(/這樣司機才不會跑錯喔?[！!。]?/g, "")
+    .replace(/為了避免司機跑錯[，,、\s]*/g, "")
+    .replace(/再麻煩提供一下喔?[！!。]?/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  return t || "請問哪一區？";
 }
 
 function suppressAddressReaskWhenPickupVerified(reply, pickup_verified, draft) {
@@ -1012,6 +1030,7 @@ export async function parseOrderFromText(messageText, options = {}) {
           reply = ensureSurchargeQuestionInReply(reply, draft.vehicle_request_type);
           reply = suppressAddressReaskWhenPickupVerified(reply, pickup_verified, draft);
           reply = finalizeCustomerFareReply(reply, draft.estimated_fare_text, messageText);
+          reply = enforceStrictReplyBans(reply);
 
           return {
             ride_related: Boolean(obj.ride_related),
