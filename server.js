@@ -116,7 +116,12 @@ function routeKey(pickup, dropoff) {
 }
 
 function googleMapsApiKey() {
-  return String(process.env.MAPS_API_KEY ?? process.env.GOOGLE_MAPS_API_KEY ?? "").trim();
+  return String(
+    process.env.Maps_API_KEY ??
+      process.env.MAPS_API_KEY ??
+      process.env.GOOGLE_MAPS_API_KEY ??
+      ""
+  ).trim();
 }
 
 function sanitizePickupAddressForMaps(pickup) {
@@ -198,7 +203,7 @@ async function verifyPickupAddressWithGoogleMaps(pickup) {
 
   const key = googleMapsApiKey();
   if (!key) {
-    console.error("[Maps Verify] Missing MAPS_API_KEY/GOOGLE_MAPS_API_KEY");
+    console.error("[Maps Verify] Missing Maps_API_KEY/MAPS_API_KEY/GOOGLE_MAPS_API_KEY");
     return { ok: false, reason: "missing_api_key" };
   }
 
@@ -256,7 +261,7 @@ async function loadAlarmsDb() {
 
 async function saveAlarmsDb() {
   const out = {
-    version: "0.7.11",
+    version: "0.7.12",
     alarms: alarmsDb.alarms || {},
     waiting_dispatches: alarmsDb.waiting_dispatches || {}
   };
