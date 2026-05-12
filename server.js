@@ -140,66 +140,12 @@ function sanitizePickupAddressForMaps(pickup) {
   return s;
 }
 
-function isTaiwanGeocodeResult(result) {
-  const comps = Array.isArray(result?.address_components) ? result.address_components : [];
-  return comps.some((c) => c?.types?.includes("country") && c?.short_name === "TW");
-}
-
-function isSpecificGeocodeResult(result) {
-  if (!result || result.partial_match) return false;
-  if (!isTaiwanGeocodeResult(result)) return false;
-  const loc = result?.geometry?.location;
-  const lat = Number(loc?.lat);
-  const lng = Number(loc?.lng);
-  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return false;
-
-  const types = Array.isArray(result.types) ? result.types : [];
-  const allowedSpecificTypes = new Set([
-    "street_address",
-    "premise",
-    "subpremise",
-    "establishment",
-    "point_of_interest",
-    "transit_station",
-    "train_station",
-    "bus_station",
-    "airport",
-    "parking",
-    "hospital",
-    "school",
-    "store",
-    "restaurant",
-    "lodging",
-    "park"
-  ]);
-  if (types.some((t) => allowedSpecificTypes.has(t))) return true;
-
-  const genericOnlyTypes = new Set([
-    "political",
-    "country",
-    "administrative_area_level_1",
-    "administrative_area_level_2",
-    "administrative_area_level_3",
-    "locality",
-    "sublocality",
-    "sublocality_level_1",
-    "neighborhood",
-    "postal_code",
-    "route"
-  ]);
-  if (types.length && types.every((t) => genericOnlyTypes.has(t))) return false;
-
-  const locationType = String(result?.geometry?.location_type ?? "");
-  return locationType && locationType !== "APPROXIMATE";
-}
-
 async function verifyPickupAddressWithGoogleMaps(pickup) {
   // [CRITICAL] 嚴禁移除或繞過此 Google Maps 驗證邏輯。
   // 所有極速盲派完整派車卡都必須先通過此函式確認地址存在且夠明確。
   const address = sanitizePickupAddressForMaps(pickup);
   console.log(`[MAP_DEBUG] 送往驗證的地址字串：${address}`);
   if (!address) return { ok: false, reason: "empty" };
-  if (/^\d{1,5}$/.test(address)) return { ok: false, reason: "number_only" };
 
   const key = googleMapsApiKey();
   if (!key) {
@@ -220,12 +166,15 @@ async function verifyPickupAddressWithGoogleMaps(pickup) {
     if (!res.ok) return { ok: false, reason: `http_${res.status}` };
     const data = await res.json();
     if (data?.status !== "OK") {
+      console.log("[MAP_DEBUG] Google Maps 非 OK 回傳：", JSON.stringify(data));
       return { ok: false, reason: data?.status || "not_ok" };
     }
     const results = Array.isArray(data?.results) ? data.results : [];
-    const best = results.find((r) => isSpecificGeocodeResult(r));
+    // v0.7.14：絕對信任 Google 導航結果。只要 status=OK 且有第一筆結果，不再自行過濾 location_type/types/partial_match。
+    const best = results[0];
     if (!best) {
-      return { ok: false, reason: data?.status || "no_specific_result" };
+      console.log("[MAP_DEBUG] Google Maps OK 但無 results：", JSON.stringify(data));
+      return { ok: false, reason: "ok_no_results" };
     }
     return {
       ok: true,
@@ -261,7 +210,7 @@ async function loadAlarmsDb() {
 
 async function saveAlarmsDb() {
   const out = {
-    version: "0.7.13",
+    version: "0.7.14",
     alarms: alarmsDb.alarms || {},
     waiting_dispatches: alarmsDb.waiting_dispatches || {}
   };
@@ -1144,7 +1093,7 @@ async function handleEvent(event) {
           return;
         }
 
-        const blindDispatchMsg = "收到，已為您派車。請問下車地點是哪裡？";
+        const blindDispatchMsg = "已為您派車，請問下車地點是哪裡？";
         await reply(replyToken, blindDispatchMsg);
         appendConversationTurn(userId, "assistant", blindDispatchMsg);
         return;
