@@ -210,7 +210,7 @@ async function loadAlarmsDb() {
 
 async function saveAlarmsDb() {
   const out = {
-    version: "0.7.14",
+    version: "0.7.16",
     alarms: alarmsDb.alarms || {},
     waiting_dispatches: alarmsDb.waiting_dispatches || {}
   };
@@ -382,17 +382,16 @@ async function handleEvent(event) {
 
     const shouldParseAi = (hasAirportKeyword || hasTimeKeyword || hasDateKeyword) && hasLocationKeyword;
 
+    const adminGid = (process.env.ADMIN_GROUP_ID || "").trim();
+    const isAdminDriverMainGroup =
+      sourceType === "group" && Boolean(adminGid) && event.source?.groupId === adminGid;
+    const isDriverFleetLineGroup = sourceType === "group" && event.source?.groupId === DRIVER_GROUP_ID;
+    // v0.7.16：司機主群／司機 LINE 群絕不走乘客叫車 + Google Maps 前置 AI（地名+數字如「汐止10」為喊單，非地址）
+    const skipPassengerAiPreparse = isAdminDriverMainGroup || isDriverFleetLineGroup;
+
     // v0.3.6 審查修復：AI 解析只做一次，任何來源都不被 group return 擋掉
     let aiResult = null;
-    if (
-      shouldParseAi &&
-      !(
-        sourceType === "group" &&
-        process.env.ADMIN_GROUP_ID &&
-        event.source?.groupId === process.env.ADMIN_GROUP_ID &&
-        text.startsWith("/報價")
-      )
-    ) {
+    if (shouldParseAi && !skipPassengerAiPreparse) {
       console.log("[AI] parseOrderFromText() input:", text);
       const currentDateTime = new Date();
       aiResult = await parseOrderFromText(text, {
@@ -449,7 +448,7 @@ async function handleEvent(event) {
     }
 
     if (sourceType === "group") {
-      if (process.env.ADMIN_GROUP_ID && event.source.groupId === process.env.ADMIN_GROUP_ID) {
+      if (adminGid && event.source.groupId === adminGid) {
         if (text.startsWith("/報價")) {
           const m = text.match(/^\/報價\s+(\d+)(?:\s+(fix))?\s*$/);
           const amount = m ? Number(m[1]) : NaN;
@@ -510,11 +509,15 @@ async function handleEvent(event) {
           );
           return;
         }
-        return;
+        // v0.7.16：司機主群其餘訊息 → 與司機 LINE 群相同，走 Rs 喊單／狀態（不在此 return）
       }
 
-      // v0.3.6：此處不再做第二次 AI 解析；AI 已在上方 shouldParseAi 區塊統一處理
-      if (event.source.groupId !== DRIVER_GROUP_ID) {
+      // v0.7.16：司機主群（ADMIN_GROUP_ID）與司機 LINE 群皆為「喊單介面」
+      const onDriverBidSurface =
+        event.source.groupId === DRIVER_GROUP_ID ||
+        (Boolean(adminGid) && event.source.groupId === adminGid);
+      // v0.3.6：此處不再做第二次 AI 解析；乘客側 AI 已在上方 shouldParseAi 區塊統一處理（司機群已排除）
+      if (!onDriverBidSurface) {
         return;
       }
       if (orders.length === 0) return;
