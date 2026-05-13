@@ -157,7 +157,7 @@ ${kbFareHint ? kbFareHint : "（本則尚未由系統預先命中 KB 定額；�
 - 地圖是否存在由 server.js 判定；你不要自行宣稱「地圖已找到」。
 - time_clear：時間具體可派車且寫入 draft.time 才 true；pickup_verified=false 則 time_clear 必 false。
 
-【發送門檻對齊（v0.7.14 極速盲派 + Google Maps 安全鎖；v0.7.16 司機黑話不得誤觸）】
+【發送門檻對齊（v0.7.14 極速盲派 + Google Maps 安全鎖；v0.7.16 司機黑話不得誤觸；v0.7.17 地圖回傳地址 server 端清洗）】
 - server.js 只要萃取到上車點候選，會先呼叫 Google Maps API 實體驗證；只要 Google Maps 回傳 status=OK，即視為地圖上找得到，才建立訂單並向司機群發送唯一一次派車卡。
 - 你只負責解析資料與自然回話，**嚴禁**在 reply 貼整段「❤️‍🔥加速派車格式」或表格式條列。
 - 如果已取得上車點但缺下車點，reply 應簡短承接：「已為您派車，請問下車地點是哪裡？」；後續補資料只更新資料或由 server.js 純文字通知已接單司機，絕不重發派車卡。

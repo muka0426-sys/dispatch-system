@@ -42,6 +42,8 @@ let orders = [];
 let nextOrderSeq = 1;
 let pendingDriver = {};
 const penaltyTracker = createPenaltyTracker();
+/** v0.7.17：司機主群無待接單時的報班紀錄（記憶體，供稽核／除錯） */
+const driverAdminCheckins = [];
 const abnormalChargingDrivers = new Map(); // driverUserId -> { count, lastAtMs }
 const activeAlarms = new Map(); // key(orderId) -> timeoutId
 
@@ -140,6 +142,63 @@ function sanitizePickupAddressForMaps(pickup) {
   return s;
 }
 
+function normalizeTaiwanAddressChars(s) {
+  return String(s ?? "")
+    .replace(/\u81fa/g, "\u53f0")
+    .trim();
+}
+
+function pickAddressComponent(components, typeName) {
+  if (!Array.isArray(components)) return "";
+  for (const c of components) {
+    if ((c.types || []).includes(typeName)) {
+      return normalizeTaiwanAddressChars(String(c.long_name || c.short_name || "").trim());
+    }
+  }
+  return "";
+}
+
+/**
+ * v0.7.17：僅用 address_components 組短地址（縣市＋區＋路＋門牌），禁止直接使用未處理的 formatted_address。
+ */
+function buildShortTaiwanStreetFromComponents(components) {
+  if (!Array.isArray(components) || !components.length) return "";
+  const a1 = pickAddressComponent(components, "administrative_area_level_1");
+  const a2 =
+    pickAddressComponent(components, "administrative_area_level_2") ||
+    pickAddressComponent(components, "administrative_area_level_3") ||
+    pickAddressComponent(components, "locality") ||
+    pickAddressComponent(components, "sublocality_level_1");
+  const route = pickAddressComponent(components, "route");
+  const sn = pickAddressComponent(components, "street_number");
+  let s = `${a1}${a2}${route}`;
+  if (sn) s += `${sn}號`;
+  return s.replace(/\s+/g, "").trim();
+}
+
+/**
+ * v0.7.17：無法精準組件解析時，用 Regex 清洗 formatted_address（郵遞區號、台灣、村里鄰、號後贅詞）。
+ */
+function cleanFormattedAddressFallback(formatted) {
+  let s = normalizeTaiwanAddressChars(String(formatted ?? "").trim());
+  s = s.replace(/^\d{3}\s*-?\s*\d{3}\s*/, "");
+  s = s.replace(/^\d{5,8}\s*/, "");
+  s = s.replace(/^台灣\s*|^臺灣\s*/, "");
+  s = s.replace(/台灣|臺灣/g, "");
+  s = s.replace(/[\u4e00-\u9fff]{2,5}里(?:[\u4e00-\u9fff]{1,4}鄰)?(?=[\u4e00-\u9fff]{0,12}(?:路|街|段|巷|弄))/g, "");
+  s = s.replace(/\s+/g, "");
+  s = s.replace(/(號)(?![之樓弄巷\d\-\.Ff])([^\d，,。；;／/\s].*)$/u, "$1");
+  return s.trim();
+}
+
+function shortenGeocodeDisplayAddress(best) {
+  const formatted = String(best?.formatted_address ?? "").trim();
+  const fromParts = buildShortTaiwanStreetFromComponents(best?.address_components);
+  if (fromParts && /(路|街|段|巷|弄)/.test(fromParts) && fromParts.length >= 6) return fromParts;
+  const fb = cleanFormattedAddressFallback(formatted);
+  return fb || normalizeTaiwanAddressChars(formatted);
+}
+
 async function verifyPickupAddressWithGoogleMaps(pickup) {
   // [CRITICAL] 嚴禁移除或繞過此 Google Maps 驗證邏輯。
   // 所有極速盲派完整派車卡都必須先通過此函式確認地址存在且夠明確。
@@ -176,9 +235,10 @@ async function verifyPickupAddressWithGoogleMaps(pickup) {
       console.log("[MAP_DEBUG] Google Maps OK 但無 results：", JSON.stringify(data));
       return { ok: false, reason: "ok_no_results" };
     }
+    const cleanAddr = shortenGeocodeDisplayAddress(best);
     return {
       ok: true,
-      formatted_address: String(best.formatted_address ?? address).trim(),
+      formatted_address: cleanAddr || String(best.formatted_address ?? address).trim(),
       place_id: String(best.place_id ?? "").trim(),
       location: best.geometry?.location ?? null,
       types: best.types || []
@@ -210,7 +270,7 @@ async function loadAlarmsDb() {
 
 async function saveAlarmsDb() {
   const out = {
-    version: "0.7.16",
+    version: "0.7.17",
     alarms: alarmsDb.alarms || {},
     waiting_dispatches: alarmsDb.waiting_dispatches || {}
   };
@@ -363,6 +423,64 @@ async function handleEvent(event) {
     const text = event.message.text.trim();
     sourceType = event.source?.type;
 
+    const adminGid = (process.env.ADMIN_GROUP_ID || "").trim();
+    // v0.7.17：司機主群物理分流（最前）：禁止進入客群 AI／假資警報／叫車補全流程
+    if (sourceType === "group" && adminGid && event.source?.groupId === adminGid) {
+      console.log("[ADMIN_DRIVER][v0.7.17]", event.source?.groupId, text);
+      if (text.startsWith("/報價")) {
+        const m = text.match(/^\/報價\s+(\d+)(?:\s+(fix))?\s*$/);
+        const amount = m ? Number(m[1]) : NaN;
+        const isFix = Boolean(m?.[2]);
+        if (!Number.isFinite(amount) || amount <= 0) {
+          await reply(replyToken, "格式錯誤，請回覆：/報價 金額（例如 /報價 250）");
+          return;
+        }
+        const req = pendingAdminPricing.shift();
+        if (!req) {
+          await reply(replyToken, "目前沒有待報價路線。");
+          return;
+        }
+        if (isAbnormalBossPrice({ amount, baselineFare: req.baselineFare }) && req.confirmAmount !== amount) {
+          req.confirmAmount = amount;
+          pendingAdminPricing.unshift(req);
+          await reply(
+            replyToken,
+            `老闆，確認是報價 $${Math.round(amount)} 嗎？此價格高於系統估計值 $${Math.round(req.baselineFare)}。`
+          );
+          return;
+        }
+        if (isFix) {
+          await updateKnowledgeBase(req.route_key, amount);
+          await reply(replyToken, `已永久學習：${req.route_key} = $${Math.round(amount)}`);
+        } else {
+          await reply(replyToken, `已回覆一次：${req.route_key} = $${Math.round(amount)}（未存檔）`);
+        }
+        await replyOnceToCustomer(
+          req.customerId,
+          `收到，這趟先估$${Math.round(amount)}左右，可以嗎？要的話回我時間。`
+        );
+        return;
+      }
+      if (text.startsWith("/遲到")) {
+        const m = text.match(/^\/遲到\s+(\d+)\s+(\d+)\s*$/);
+        const lateMin = m ? Number(m[1]) : NaN;
+        const fare = m ? Number(m[2]) : NaN;
+        if (!Number.isFinite(lateMin) || lateMin < 0 || !Number.isFinite(fare) || fare <= 0) {
+          await reply(replyToken, "格式錯誤，請回覆：/遲到 分鐘 原車資（例如 /遲到 8 300）");
+          return;
+        }
+        const ratio = lateMin <= 10 ? 0.8 : 0.6;
+        const discounted = Math.round(fare * ratio);
+        await reply(
+          replyToken,
+          `遲到補償：${lateMin}分 → ${Math.round(ratio * 100)}折，原$${fare} → $${discounted}`
+        );
+        return;
+      }
+      await processDriverFleetGroupMessage(event, replyToken, userId, text, { allowIdleCheckin: true });
+      return;
+    }
+
     console.log("收到訊息來源 ID:", event.source?.groupId || event.source?.userId);
     console.log("📩", sourceType, text);
 
@@ -382,12 +500,9 @@ async function handleEvent(event) {
 
     const shouldParseAi = (hasAirportKeyword || hasTimeKeyword || hasDateKeyword) && hasLocationKeyword;
 
-    const adminGid = (process.env.ADMIN_GROUP_ID || "").trim();
-    const isAdminDriverMainGroup =
-      sourceType === "group" && Boolean(adminGid) && event.source?.groupId === adminGid;
     const isDriverFleetLineGroup = sourceType === "group" && event.source?.groupId === DRIVER_GROUP_ID;
-    // v0.7.16：司機主群／司機 LINE 群絕不走乘客叫車 + Google Maps 前置 AI（地名+數字如「汐止10」為喊單，非地址）
-    const skipPassengerAiPreparse = isAdminDriverMainGroup || isDriverFleetLineGroup;
+    // 司機 LINE 群不走乘客叫車前置 AI（主群已於最前 return）
+    const skipPassengerAiPreparse = isDriverFleetLineGroup;
 
     // v0.3.6 審查修復：AI 解析只做一次，任何來源都不被 group return 擋掉
     let aiResult = null;
@@ -448,315 +563,9 @@ async function handleEvent(event) {
     }
 
     if (sourceType === "group") {
-      if (adminGid && event.source.groupId === adminGid) {
-        if (text.startsWith("/報價")) {
-          const m = text.match(/^\/報價\s+(\d+)(?:\s+(fix))?\s*$/);
-          const amount = m ? Number(m[1]) : NaN;
-          const isFix = Boolean(m?.[2]);
-          if (!Number.isFinite(amount) || amount <= 0) {
-            await reply(replyToken, "格式錯誤，請回覆：/報價 金額（例如 /報價 250）");
-            return;
-          }
-          const req = pendingAdminPricing.shift();
-          if (!req) {
-            await reply(replyToken, "目前沒有待報價路線。");
-            return;
-          }
-
-          // 防呆：明顯高於系統估計值 → 先要求確認
-          if (isAbnormalBossPrice({ amount, baselineFare: req.baselineFare }) && req.confirmAmount !== amount) {
-            // 放回隊列最前面，並記住待確認金額
-            req.confirmAmount = amount;
-            pendingAdminPricing.unshift(req);
-            await reply(
-              replyToken,
-              `老闆，確認是報價 $${Math.round(amount)} 嗎？此價格高於系統估計值 $${Math.round(req.baselineFare)}。`
-            );
-            return;
-          }
-
-          if (isFix) {
-            await updateKnowledgeBase(req.route_key, amount);
-            await reply(replyToken, `已永久學習：${req.route_key} = $${Math.round(amount)}`);
-          } else {
-            await reply(replyToken, `已回覆一次：${req.route_key} = $${Math.round(amount)}（未存檔）`);
-          }
-
-          // 轉發回原乘客（replyOnce：只回覆一次，不影響學習）
-          await replyOnceToCustomer(
-            req.customerId,
-            `收到，這趟先估$${Math.round(amount)}左右，可以嗎？要的話回我時間。`
-          );
-          return;
-        }
-
-        // v0.5.0：/遲到 指令（折扣規則）
-        // 格式：/遲到 {分鐘} {原車資}
-        if (text.startsWith("/遲到")) {
-          const m = text.match(/^\/遲到\s+(\d+)\s+(\d+)\s*$/);
-          const lateMin = m ? Number(m[1]) : NaN;
-          const fare = m ? Number(m[2]) : NaN;
-          if (!Number.isFinite(lateMin) || lateMin < 0 || !Number.isFinite(fare) || fare <= 0) {
-            await reply(replyToken, "格式錯誤，請回覆：/遲到 分鐘 原車資（例如 /遲到 8 300）");
-            return;
-          }
-
-          const ratio = lateMin <= 10 ? 0.8 : 0.6;
-          const discounted = Math.round(fare * ratio);
-          await reply(
-            replyToken,
-            `遲到補償：${lateMin}分 → ${Math.round(ratio * 100)}折，原$${fare} → $${discounted}`
-          );
-          return;
-        }
-        // v0.7.16：司機主群其餘訊息 → 與司機 LINE 群相同，走 Rs 喊單／狀態（不在此 return）
+      if (event.source.groupId === DRIVER_GROUP_ID) {
+        await processDriverFleetGroupMessage(event, replyToken, userId, text, { allowIdleCheckin: false });
       }
-
-      // v0.7.16：司機主群（ADMIN_GROUP_ID）與司機 LINE 群皆為「喊單介面」
-      const onDriverBidSurface =
-        event.source.groupId === DRIVER_GROUP_ID ||
-        (Boolean(adminGid) && event.source.groupId === adminGid);
-      // v0.3.6：此處不再做第二次 AI 解析；乘客側 AI 已在上方 shouldParseAi 區塊統一處理（司機群已排除）
-      if (!onDriverBidSurface) {
-        return;
-      }
-      if (orders.length === 0) return;
-
-      const dispatcherMark = parseRsDispatcherMark(text);
-      const waitingOrder = getWaitingOrderForDriverMessage(text, {
-        isDispatcherMark: Boolean(dispatcherMark)
-      });
-      if (!waitingOrder) return;
-
-      waitingOrder.rs = waitingOrder.rs || {
-        timing: waitingOrder.date ? "reservation" : "instant",
-        bids: [],
-        dispatcherMarkedAtMs: null,
-        assignedAtMs: null,
-        assignedDriverUserId: null,
-        arrivedTimer: null
-      };
-
-      // ===== 派單員標記（@）→ 立刻自動噴車卡 =====
-      if (dispatcherMark) {
-        waitingOrder.rs.dispatcherMarkedAtMs = Date.now();
-        const leader = pickRsLeadingBid({ timing: waitingOrder.rs.timing, bids: waitingOrder.rs.bids });
-        if (!leader) {
-          await reply(replyToken, "目前沒有有效喊單，先喊單再標記喔。");
-          return;
-        }
-
-        waitingOrder.status = "matched";
-        waitingOrder.driverId = leader.driverUserId;
-        waitingOrder.driverEta = leader.kind === "minutes" ? String(leader.minutes ?? "") : "準";
-        waitingOrder.rs.assignedAtMs = Date.now();
-        waitingOrder.rs.assignedDriverUserId = leader.driverUserId;
-
-        await reply(replyToken, "已標記，車卡我這邊直接噴。");
-
-        await notifyCustomerDriverMatched(
-          waitingOrder.customerId,
-          leader.driverUserId,
-          waitingOrder.driverEta
-        );
-
-        const cardText = getDriverCardText(leader.driverUserId);
-        await pushText(waitingOrder.customerId, cardText);
-        return;
-      }
-
-      // ===== 喊單 =====
-      const bid = parseRsDriverBid(text);
-      if (bid.kind === "ready" || bid.kind === "minutes") {
-        const validation = validateRsBid({ timing: waitingOrder.rs.timing, bid });
-        if (!validation.ok) {
-          await reply(replyToken, validation.reason);
-          return;
-        }
-
-        const newBid = {
-          driverUserId: userId,
-          createdAtMs: Date.now(),
-          kind: bid.kind,
-          minutes: bid.kind === "minutes" ? bid.minutes : undefined
-        };
-
-        const prevLeader = pickRsLeadingBid({ timing: waitingOrder.rs.timing, bids: waitingOrder.rs.bids });
-        waitingOrder.rs.bids.push(newBid);
-        const leader = pickRsLeadingBid({ timing: waitingOrder.rs.timing, bids: waitingOrder.rs.bids });
-
-          // 同分強姦：同分後喊者可強姦取代；若已標記，僅「寶劍 1 分鐘內有效」
-        if (
-          canRsRapeTie({
-            timing: waitingOrder.rs.timing,
-            leadingBid: prevLeader,
-            challengerBid: newBid,
-            dispatcherMarkedAtMs: waitingOrder.rs.dispatcherMarkedAtMs,
-            assignedAtMs: waitingOrder.rs.assignedAtMs
-          })
-        ) {
-          // 以「後喊者」覆蓋為 leader（同分情境），並登記賠償追蹤
-          penaltyTracker.onRapeSuccess({
-            orderId: waitingOrder.orderId,
-            fromDriverUserId: prevLeader?.driverUserId,
-            toDriverUserId: newBid.driverUserId,
-            bidMinutes: newBid.minutes,
-            assignedAtMs: waitingOrder.rs.assignedAtMs || Date.now()
-          });
-
-          await reply(replyToken, "同分可強姦成立，先等派單員標記。");
-          return;
-        }
-
-        if (leader && leader.driverUserId === userId) {
-          const eta = leader.kind === "minutes" ? String(leader.minutes ?? "") : "準";
-          pendingDriver[waitingOrder.orderId] = { userId, time: eta };
-          await reply(replyToken, `目前領先：${eta}${eta === "準" ? "" : "分"}，等派單員@標記我就噴車卡。`);
-          return;
-        }
-
-        await reply(replyToken, "收到，你目前不是領先喊單。");
-        return;
-      }
-
-      // ===== 車卡 =====
-      const cardTargetOrder = getWaitingOrderByPendingDriver(userId);
-      if (cardTargetOrder) {
-        const pending = pendingDriver[cardTargetOrder.orderId];
-        cardTargetOrder.status = "matched";
-        cardTargetOrder.driverId = userId;
-        cardTargetOrder.driverEta = pending.time;
-
-        await reply(replyToken, "已派你出發 🚗");
-
-        await notifyCustomerDriverMatched(cardTargetOrder.customerId, userId, pending.time);
-
-        // 👉 再補車卡（司機自貼卡片）
-        await pushText(cardTargetOrder.customerId, text);
-        delete pendingDriver[cardTargetOrder.orderId];
-
-        return;
-      }
-
-      // ===== 到點 =====
-      const matchedOrder = getDriverOrderByStatus(userId, "matched");
-      if (matchedOrder && text.includes("到")) {
-        matchedOrder.status = "arrived";
-        penaltyTracker.onArrived({ orderId: matchedOrder.orderId, arrivedAtMs: Date.now() });
-
-        if (matchedOrder.rs?.arrivedTimer) clearTimeout(matchedOrder.rs.arrivedTimer);
-        matchedOrder.rs = matchedOrder.rs || {};
-        matchedOrder.rs.arrivedTimer = setTimeout(async () => {
-          try {
-            await pushText(
-              matchedOrder.customerId,
-              "司機已到點，提醒一下：超過5分鐘會開始等候費，1分鐘都是5元喲🥰"
-            );
-          } catch (e) {
-            console.error("[arrivedTimer]", e?.message || e);
-          }
-        }, 5 * 60_000);
-
-        await reply(replyToken, "已通知客人");
-
-        await pushText(
-          matchedOrder.customerId,
-`📍 司機已抵達，請準備上車`
-        );
-
-        return;
-      }
-
-      // ===== 上車 =====
-      const arrivedOrder = getDriverOrderByStatus(userId, "arrived");
-      if (arrivedOrder && text.includes("客上")) {
-        arrivedOrder.status = "onboard";
-
-        await pushText(
-          arrivedOrder.customerId,
-`✅ 司機已回報您已上車
-感謝您的搭乘 🙏`
-        );
-
-        return;
-      }
-
-      // ===== 客下 {公里}/{車資}：核對 5/2 直走表 =====
-      const onboardOrder = getDriverOrderByStatus(userId, "onboard");
-      const state = parseRsStateSignal(text);
-      if (onboardOrder && state.kind === "dropoff") {
-        const check = rsCheckOvercharge({ km: state.km, fare: state.fare });
-        penaltyTracker.onFareKnown({ orderId: onboardOrder.orderId, fare: state.fare });
-
-        // v0.2.1：結單稽核（回報金額/里程 vs Google最短預估）
-        const baselineFare = Number(onboardOrder?.estimatedRouteFare ?? NaN);
-        const baselineKm = Number(onboardOrder?.estimatedRouteKm ?? NaN);
-        const baselineValid = Number.isFinite(baselineFare) && baselineFare > 0 && Number.isFinite(baselineKm) && baselineKm > 0;
-        const reportedKm = Number(state.km);
-        const reportedFare = Number(state.fare);
-        const reportedValid = Number.isFinite(reportedKm) && reportedKm > 0 && Number.isFinite(reportedFare) && reportedFare > 0;
-
-        if (baselineValid && reportedValid) {
-          const diffFare = reportedFare - baselineFare;
-          const kmDeviationRate = Math.abs(reportedKm - baselineKm) / baselineKm; // 0~inf
-          const isAbnormal = diffFare > 30 || kmDeviationRate > 0.2;
-
-          if (isAbnormal) {
-            const prev = abnormalChargingDrivers.get(userId) || { count: 0, lastAtMs: 0 };
-            abnormalChargingDrivers.set(userId, { count: prev.count + 1, lastAtMs: Date.now() });
-
-            // 群組：真人介入（禁止肯定句）
-            await reply(
-              replyToken,
-              `此趟行程費用 ($${reportedFare}) 與系統預估最短里程 ($${baselineFare}) 偏差較大，已轉交由行政人員進行人工審核結單。`
-            );
-
-            // 管理員群：送出整理資訊
-            const adminMsg =
-              `【異常收費待審】\n` +
-              `司機編號：${userId}\n` +
-              `訂單：${onboardOrder.orderId}\n` +
-              `上車：${onboardOrder.pickup || onboardOrder.address || "未提供"}\n` +
-              `下車：${onboardOrder.dropoff || "未提供"}\n` +
-              `系統最短：${baselineKm}km / $${baselineFare}\n` +
-              `司機回報：${reportedKm}km / $${reportedFare}\n` +
-              `差額：$${Math.round(diffFare)}；里程偏差：${Math.round(kmDeviationRate * 100)}%`;
-            if (process.env.ADMIN_GROUP_ID) {
-              await pushText(process.env.ADMIN_GROUP_ID, adminMsg);
-            } else {
-              console.error("[ADMIN_GROUP_ID] unset, admin message:", adminMsg);
-            }
-
-            await appendLogicErrorLog({
-              title: "司機異常收費：差額>30或里程偏差>20%（真人審核）",
-              driverUserId: userId,
-              orderId: onboardOrder.orderId,
-              baselineKm,
-              baselineFare,
-              reportedKm,
-              reportedFare
-            });
-
-            return;
-          }
-        }
-
-        const comp = penaltyTracker.computeCompensation({ orderId: onboardOrder.orderId });
-        if (comp) {
-          await reply(
-            replyToken,
-            `強姦成功但遲到：需賠${comp.compensation}（車資3成）給被搶單司機。`
-          );
-        }
-
-        if (!check.ok) {
-          await reply(replyToken, `注意：5/2直走表預估${check.expected}，你填${state.fare}疑似溢收+${check.diff}`);
-          return;
-        }
-        await reply(replyToken, `收到，5/2直走表預估${check.expected}，你填${state.fare}OK。`);
-        return;
-      }
-
       return;
     }
 
@@ -1951,6 +1760,277 @@ function legacyFormToDispatchDraft(form) {
     dropoff: String(form.dropoff ?? "").trim(),
     passengers: String(form.passengers ?? "").trim()
   };
+}
+
+function extractDriverCheckinLocationLabel(text) {
+  const raw = String(text ?? "").trim();
+  if (/^準$/.test(raw)) return "";
+  const m = raw.match(/^(.+?)\s*(\d{1,3})\s*$/u);
+  if (!m) return "";
+  return m[1].replace(/\s+/g, "").trim();
+}
+
+function recordDriverAdminCheckin(entry) {
+  driverAdminCheckins.push({ ...entry, at: Date.now() });
+  while (driverAdminCheckins.length > 2000) driverAdminCheckins.shift();
+  console.log("[DriverCheckin]", JSON.stringify(entry));
+}
+
+/** v0.7.17：主群無待接單時，地名+數字／準 仍即時報班回覆。 */
+async function tryReplyIdleDriverCheckinForAdminGroup(replyToken, userId, text) {
+  const bid = parseRsDriverBid(text);
+  if (bid.kind !== "ready" && bid.kind !== "minutes") return false;
+  const place = extractDriverCheckinLocationLabel(text);
+  if (bid.kind === "ready") {
+    const msg = "✅ 收到，司機已報「準」，可接單時請派單員依板規 @ 標記。";
+    await reply(replyToken, msg);
+    recordDriverAdminCheckin({ userId, raw: text, kind: "ready", place: place || "(準)" });
+    return true;
+  }
+  const label = place || "定位點";
+  const msg = `✅ 收到，司機於 ${label}，預計 ${bid.minutes} 分鐘到達`;
+  await reply(replyToken, msg);
+  recordDriverAdminCheckin({ userId, raw: text, kind: "minutes", place: label, minutes: bid.minutes });
+  return true;
+}
+
+/**
+ * 司機 LINE 群與司機主群共用：Rs 喊單、車卡、到點、客下核對。
+ * allowIdleCheckin：僅主群在無 waiting 單時，對地名+數字／準 發送報班回覆。
+ */
+async function processDriverFleetGroupMessage(_event, replyToken, userId, text, { allowIdleCheckin }) {
+  if (orders.length === 0) {
+    if (allowIdleCheckin && (await tryReplyIdleDriverCheckinForAdminGroup(replyToken, userId, text))) return;
+    return;
+  }
+
+  const dispatcherMark = parseRsDispatcherMark(text);
+  const waitingOrder = getWaitingOrderForDriverMessage(text, {
+    isDispatcherMark: Boolean(dispatcherMark)
+  });
+  if (!waitingOrder) {
+    if (allowIdleCheckin && (await tryReplyIdleDriverCheckinForAdminGroup(replyToken, userId, text))) return;
+    return;
+  }
+
+  waitingOrder.rs = waitingOrder.rs || {
+    timing: waitingOrder.date ? "reservation" : "instant",
+    bids: [],
+    dispatcherMarkedAtMs: null,
+    assignedAtMs: null,
+    assignedDriverUserId: null,
+    arrivedTimer: null
+  };
+
+  if (dispatcherMark) {
+    waitingOrder.rs.dispatcherMarkedAtMs = Date.now();
+    const leader = pickRsLeadingBid({ timing: waitingOrder.rs.timing, bids: waitingOrder.rs.bids });
+    if (!leader) {
+      await reply(replyToken, "目前沒有有效喊單，先喊單再標記喔。");
+      return;
+    }
+
+    waitingOrder.status = "matched";
+    waitingOrder.driverId = leader.driverUserId;
+    waitingOrder.driverEta = leader.kind === "minutes" ? String(leader.minutes ?? "") : "準";
+    waitingOrder.rs.assignedAtMs = Date.now();
+    waitingOrder.rs.assignedDriverUserId = leader.driverUserId;
+
+    await reply(replyToken, "已標記，車卡我這邊直接噴。");
+
+    await notifyCustomerDriverMatched(
+      waitingOrder.customerId,
+      leader.driverUserId,
+      waitingOrder.driverEta
+    );
+
+    const cardText = getDriverCardText(leader.driverUserId);
+    await pushText(waitingOrder.customerId, cardText);
+    return;
+  }
+
+  const bid = parseRsDriverBid(text);
+  if (bid.kind === "ready" || bid.kind === "minutes") {
+    const validation = validateRsBid({ timing: waitingOrder.rs.timing, bid });
+    if (!validation.ok) {
+      await reply(replyToken, validation.reason);
+      return;
+    }
+
+    const newBid = {
+      driverUserId: userId,
+      createdAtMs: Date.now(),
+      kind: bid.kind,
+      minutes: bid.kind === "minutes" ? bid.minutes : undefined
+    };
+
+    const prevLeader = pickRsLeadingBid({ timing: waitingOrder.rs.timing, bids: waitingOrder.rs.bids });
+    waitingOrder.rs.bids.push(newBid);
+    const leader = pickRsLeadingBid({ timing: waitingOrder.rs.timing, bids: waitingOrder.rs.bids });
+
+    if (
+      canRsRapeTie({
+        timing: waitingOrder.rs.timing,
+        leadingBid: prevLeader,
+        challengerBid: newBid,
+        dispatcherMarkedAtMs: waitingOrder.rs.dispatcherMarkedAtMs,
+        assignedAtMs: waitingOrder.rs.assignedAtMs
+      })
+    ) {
+      penaltyTracker.onRapeSuccess({
+        orderId: waitingOrder.orderId,
+        fromDriverUserId: prevLeader?.driverUserId,
+        toDriverUserId: newBid.driverUserId,
+        bidMinutes: newBid.minutes,
+        assignedAtMs: waitingOrder.rs.assignedAtMs || Date.now()
+      });
+
+      await reply(replyToken, "同分可強姦成立，先等派單員標記。");
+      return;
+    }
+
+    if (leader && leader.driverUserId === userId) {
+      const eta = leader.kind === "minutes" ? String(leader.minutes ?? "") : "準";
+      pendingDriver[waitingOrder.orderId] = { userId, time: eta };
+      await reply(replyToken, `目前領先：${eta}${eta === "準" ? "" : "分"}，等派單員@標記我就噴車卡。`);
+      return;
+    }
+
+    await reply(replyToken, "收到，你目前不是領先喊單。");
+    return;
+  }
+
+  const cardTargetOrder = getWaitingOrderByPendingDriver(userId);
+  if (cardTargetOrder) {
+    const pending = pendingDriver[cardTargetOrder.orderId];
+    cardTargetOrder.status = "matched";
+    cardTargetOrder.driverId = userId;
+    cardTargetOrder.driverEta = pending.time;
+
+    await reply(replyToken, "已派你出發 🚗");
+
+    await notifyCustomerDriverMatched(cardTargetOrder.customerId, userId, pending.time);
+
+    await pushText(cardTargetOrder.customerId, text);
+    delete pendingDriver[cardTargetOrder.orderId];
+
+    return;
+  }
+
+  const matchedOrder = getDriverOrderByStatus(userId, "matched");
+  if (matchedOrder && text.includes("到")) {
+    matchedOrder.status = "arrived";
+    penaltyTracker.onArrived({ orderId: matchedOrder.orderId, arrivedAtMs: Date.now() });
+
+    if (matchedOrder.rs?.arrivedTimer) clearTimeout(matchedOrder.rs.arrivedTimer);
+    matchedOrder.rs = matchedOrder.rs || {};
+    matchedOrder.rs.arrivedTimer = setTimeout(async () => {
+      try {
+        await pushText(
+          matchedOrder.customerId,
+          "司機已到點，提醒一下：超過5分鐘會開始等候費，1分鐘都是5元喲🥰"
+        );
+      } catch (e) {
+        console.error("[arrivedTimer]", e?.message || e);
+      }
+    }, 5 * 60_000);
+
+    await reply(replyToken, "已通知客人");
+
+    await pushText(
+      matchedOrder.customerId,
+`📍 司機已抵達，請準備上車`
+    );
+
+    return;
+  }
+
+  const arrivedOrder = getDriverOrderByStatus(userId, "arrived");
+  if (arrivedOrder && text.includes("客上")) {
+    arrivedOrder.status = "onboard";
+
+    await pushText(
+      arrivedOrder.customerId,
+`✅ 司機已回報您已上車
+感謝您的搭乘 🙏`
+    );
+
+    return;
+  }
+
+  const onboardOrder = getDriverOrderByStatus(userId, "onboard");
+  const state = parseRsStateSignal(text);
+  if (onboardOrder && state.kind === "dropoff") {
+    const check = rsCheckOvercharge({ km: state.km, fare: state.fare });
+    penaltyTracker.onFareKnown({ orderId: onboardOrder.orderId, fare: state.fare });
+
+    const baselineFare = Number(onboardOrder?.estimatedRouteFare ?? NaN);
+    const baselineKm = Number(onboardOrder?.estimatedRouteKm ?? NaN);
+    const baselineValid = Number.isFinite(baselineFare) && baselineFare > 0 && Number.isFinite(baselineKm) && baselineKm > 0;
+    const reportedKm = Number(state.km);
+    const reportedFare = Number(state.fare);
+    const reportedValid = Number.isFinite(reportedKm) && reportedKm > 0 && Number.isFinite(reportedFare) && reportedFare > 0;
+
+    if (baselineValid && reportedValid) {
+      const diffFare = reportedFare - baselineFare;
+      const kmDeviationRate = Math.abs(reportedKm - baselineKm) / baselineKm;
+      const isAbnormal = diffFare > 30 || kmDeviationRate > 0.2;
+
+      if (isAbnormal) {
+        const prev = abnormalChargingDrivers.get(userId) || { count: 0, lastAtMs: 0 };
+        abnormalChargingDrivers.set(userId, { count: prev.count + 1, lastAtMs: Date.now() });
+
+        await reply(
+          replyToken,
+          `此趟行程費用 ($${reportedFare}) 與系統預估最短里程 ($${baselineFare}) 偏差較大，已轉交由行政人員進行人工審核結單。`
+        );
+
+        const adminMsg =
+          `【異常收費待審】\n` +
+          `司機編號：${userId}\n` +
+          `訂單：${onboardOrder.orderId}\n` +
+          `上車：${onboardOrder.pickup || onboardOrder.address || "未提供"}\n` +
+          `下車：${onboardOrder.dropoff || "未提供"}\n` +
+          `系統最短：${baselineKm}km / $${baselineFare}\n` +
+          `司機回報：${reportedKm}km / $${reportedFare}\n` +
+          `差額：$${Math.round(diffFare)}；里程偏差：${Math.round(kmDeviationRate * 100)}%`;
+        if (process.env.ADMIN_GROUP_ID) {
+          await pushText(process.env.ADMIN_GROUP_ID, adminMsg);
+        } else {
+          console.error("[ADMIN_GROUP_ID] unset, admin message:", adminMsg);
+        }
+
+        await appendLogicErrorLog({
+          title: "司機異常收費：差額>30或里程偏差>20%（真人審核）",
+          driverUserId: userId,
+          orderId: onboardOrder.orderId,
+          baselineKm,
+          baselineFare,
+          reportedKm,
+          reportedFare
+        });
+
+        return;
+      }
+    }
+
+    const comp = penaltyTracker.computeCompensation({ orderId: onboardOrder.orderId });
+    if (comp) {
+      await reply(
+        replyToken,
+        `強姦成功但遲到：需賠${comp.compensation}（車資3成）給被搶單司機。`
+      );
+    }
+
+    if (!check.ok) {
+      await reply(replyToken, `注意：5/2直走表預估${check.expected}，你填${state.fare}疑似溢收+${check.diff}`);
+      return;
+    }
+    await reply(replyToken, `收到，5/2直走表預估${check.expected}，你填${state.fare}OK。`);
+    return;
+  }
+
+  return;
 }
 
 // ========================
