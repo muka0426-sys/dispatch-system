@@ -1,6 +1,6 @@
 import "dotenv/config";
 import express from "express";
-import { pushText } from "./utils/line.js";
+import { pushText, pushMessage } from "./utils/line.js";
 import fs from "node:fs";
 import { appendFile, readFile, writeFile } from "node:fs/promises";
 import {
@@ -270,7 +270,7 @@ async function loadAlarmsDb() {
 
 async function saveAlarmsDb() {
   const out = {
-    version: "0.7.20",
+    version: "0.7.21",
     alarms: alarmsDb.alarms || {},
     waiting_dispatches: alarmsDb.waiting_dispatches || {}
   };
@@ -670,11 +670,20 @@ async function handleEvent(event) {
         }
 
         const afterTime = String(active.time ?? "").trim();
-        if (active.status === "matched" && active.driverId && beforeTime !== afterTime) {
-          const dname = getDriverDisplayName(active.driverId);
+        if (active.status === "matched" && orderDriverLineUserId(active) && beforeTime !== afterTime) {
           const adminGid = (process.env.ADMIN_GROUP_ID || "").trim();
-          if (adminGid) {
-            await pushText(adminGid, `@${dname} 客人改時間為 ${afterTime}，請那個時間前到即可`);
+          const lineUid = orderDriverLineUserId(active);
+          if (adminGid && lineUid) {
+            try {
+              await pushMessage(
+                adminGid,
+                buildMatchedDriverTimeChangeAdminMessage(lineUid, afterTime)
+              );
+            } catch (e) {
+              console.error("[ADMIN_GROUP_ID mention push]", e?.message || e);
+              const dname = getDriverDisplayName(lineUid);
+              await pushText(adminGid, `@${dname} 客人改時間為 ${afterTime}，請那個時間前到即可`);
+            }
           }
           const msg = "好的，已幫您通知司機。";
           await reply(replyToken, msg);
@@ -682,8 +691,8 @@ async function handleEvent(event) {
           return;
         }
 
-        if (active.status === "arrived" && active.driverId && beforeTime !== afterTime) {
-          const dname = getDriverDisplayName(active.driverId);
+        if (active.status === "arrived" && orderDriverLineUserId(active) && beforeTime !== afterTime) {
+          const dname = getDriverDisplayName(orderDriverLineUserId(active));
           await pushText(DRIVER_GROUP_ID, `@${dname} 客人更新資訊：時間改為${afterTime}`);
           const msg = "好的，已幫您通知司機。";
           await reply(replyToken, msg);
@@ -848,16 +857,25 @@ async function handleEvent(event) {
           const postMatchDriverNotify = new Set(["matched", "arrived"]);
           if (
             postMatchDriverNotify.has(activeForDispatch.status) &&
-            activeForDispatch.driverId &&
+            orderDriverLineUserId(activeForDispatch) &&
             diff
           ) {
-            const dname = getDriverDisplayName(activeForDispatch.driverId);
+            const lineUid = orderDriverLineUserId(activeForDispatch);
+            const dname = getDriverDisplayName(lineUid);
             const afterTime = String(activeForDispatch.time ?? "").trim();
             const timeChanged = orderBefore.time !== afterTime;
             if (activeForDispatch.status === "matched" && timeChanged) {
               const adminGid = (process.env.ADMIN_GROUP_ID || "").trim();
-              if (adminGid) {
-                await pushText(adminGid, `@${dname} 客人改時間為 ${afterTime}，請那個時間前到即可`);
+              if (adminGid && lineUid) {
+                try {
+                  await pushMessage(
+                    adminGid,
+                    buildMatchedDriverTimeChangeAdminMessage(lineUid, afterTime)
+                  );
+                } catch (e) {
+                  console.error("[ADMIN_GROUP_ID mention push]", e?.message || e);
+                  await pushText(adminGid, `@${dname} 客人改時間為 ${afterTime}，請那個時間前到即可`);
+                }
               }
             }
             const parts = diff.split("，");
@@ -1137,6 +1155,34 @@ function getDriverDisplayName(driverUserId) {
   return "司機夥伴";
 }
 
+/** LINE textV2 substitution：`{` `}` 需跳脫為 `{{` `}}`。 */
+function escapeLineTextV2Substitution(s) {
+  return String(s ?? "")
+    .replace(/\{/g, "{{")
+    .replace(/\}/g, "}}");
+}
+
+/**
+ * 主群通知：標註接單司機（LINE push 對群組請用 textV2 + mention substitution）。
+ * @param {string} driverLineUserId 司機 LINE userId（與 order.driverUserId / driverId 同源）
+ * @param {string} newTime 顯示用新時間文字
+ */
+function buildMatchedDriverTimeChangeAdminMessage(driverLineUserId, newTime) {
+  const uid = String(driverLineUserId ?? "").trim();
+  const t = escapeLineTextV2Substitution(newTime);
+  return {
+    type: "textV2",
+    text: `{drv} 客人改時間為 ${t}，請那個時間前到即可`,
+    substitution: {
+      drv: { type: "mention", mention: { type: "user", userId: uid } }
+    }
+  };
+}
+
+function orderDriverLineUserId(order) {
+  return String(order?.driverUserId ?? order?.driverId ?? "").trim();
+}
+
 function wrapRsSpecialistDispatch(body) {
   const b = String(body ?? "").trim();
   if (!b) return "❤️‍🔥RS • 專員🔥";
@@ -1248,7 +1294,7 @@ function createOrder(customerId, form) {
     const rideMs = Date.parse(normalizedRideTimestamp);
     if (Number.isFinite(rideMs)) orderDateYmd = taipeiYmdFromInstantMs(rideMs);
   }
-  const timeField = String(form.time ?? "").trim() || defaultCustomerPickupTimeNow();
+  const timeField = String(form.time ?? "").trim() || "現在";
   const newOrder = {
     orderId,
     status: "waiting",
@@ -1269,6 +1315,7 @@ function createOrder(customerId, form) {
     fakeAlertTimer: null,
     createdAt: Date.now(),
     driverId: null,
+    driverUserId: null,
     driverEta: null,
     dispatchCardSent: false,
     dispatchCardSentAtMs: null
@@ -1307,22 +1354,10 @@ function taipeiYmdFromInstantMs(ms) {
   }).format(new Date(ms));
 }
 
-/** 客人未填時間時，預設為台北當下時刻（HH:mm）。 */
-function defaultCustomerPickupTimeNow() {
-  const parts = new Intl.DateTimeFormat("en-GB", {
-    timeZone: "Asia/Taipei",
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: false
-  }).formatToParts(new Date());
-  const h = parts.find((p) => p.type === "hour")?.value ?? "00";
-  const m = parts.find((p) => p.type === "minute")?.value ?? "00";
-  return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
-}
-
+/** 客人未填時間時，後端預設為「現在」（不追問、不擋派車）。 */
 function ensureCustomerPickupTimeDefaultNow(merged) {
   const m = { ...(merged || {}) };
-  if (!String(m.time ?? "").trim()) m.time = defaultCustomerPickupTimeNow();
+  if (!String(m.time ?? "").trim()) m.time = "現在";
   return m;
 }
 
@@ -1581,12 +1616,12 @@ function parseRideForm(text) {
   const date = data["日期"];
   const passengers = data["人數"];
 
-  if (!pickup || !time) return null;
+  if (!pickup) return null;
 
   return {
     pickup,
     dropoff: dropoff || "",
-    time,
+    time: time || "現在",
     date: date || "",
     passengers: passengers || "",
     rawText: text
@@ -2090,6 +2125,7 @@ async function processDriverFleetGroupMessage(_event, replyToken, userId, text, 
 
     waitingOrder.status = "matched";
     waitingOrder.driverId = leader.driverUserId;
+    waitingOrder.driverUserId = leader.driverUserId;
     waitingOrder.driverEta = leader.kind === "minutes" ? String(leader.minutes ?? "") : "準";
     waitingOrder.rs.assignedAtMs = Date.now();
     waitingOrder.rs.assignedDriverUserId = leader.driverUserId;
@@ -2163,6 +2199,7 @@ async function processDriverFleetGroupMessage(_event, replyToken, userId, text, 
     const pending = pendingDriver[cardTargetOrder.orderId];
     cardTargetOrder.status = "matched";
     cardTargetOrder.driverId = userId;
+    cardTargetOrder.driverUserId = userId;
     cardTargetOrder.driverEta = pending.time;
 
     await reply(replyToken, "已派你出發 🚗");

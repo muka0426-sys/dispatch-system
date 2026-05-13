@@ -28,11 +28,11 @@ function clipReplyToMaxChars(text, max = REPLY_MAX_CHARS) {
 
 /** .cursorrules：盡量落在 30～50 字；過短時補一句不突兀的引導 */
 function ensureReplyLengthBand(text) {
-  const pad = "補一下地址或時間。";
+  const pad = "補一下地址或下車地點。";
   let t = clipReplyToMaxChars(String(text ?? "").trim(), REPLY_MAX_CHARS);
   if ([...t].length >= REPLY_TARGET_MIN) return t;
   t = clipReplyToMaxChars(`${t} ${pad}`, REPLY_MAX_CHARS);
-  return t || clipReplyToMaxChars("收到，請補縣市區、路名門牌與時間。", REPLY_MAX_CHARS);
+  return t || clipReplyToMaxChars("收到，請補縣市區、路名門牌。", REPLY_MAX_CHARS);
 }
 
 /** 客人是否在問事／要說明（可較長回覆）；純補地址則維持短回。 */
@@ -93,7 +93,7 @@ function buildSystemPrompt(
 - 資料尚未齊備時：像真人一樣一問一答引導，**不要**在 reply 內用「未提供」填滿假格式。
 - 你只能萃取乘客提供的上車地點文字；Google Maps 實體驗證由 server.js 負責。**不要**在 reply 內貼整段加速派車格式（卡片由系統在條件成立時附加）。
 - 行程或加價條件變動時，reply 裡的車資說明必須與 knowledge_base 定額／estimated_fare_text 邏輯一致，不可亂報價。
-- draft.pickup 非空時：你可承接該上車點文字，但**不得宣稱地圖已核實**；若仍缺資料，只能追問缺的欄位（例如下車點或時間）。
+- draft.pickup 非空時：你可承接該上車點文字，但**不得宣稱地圖已核實**；若仍缺資料，只能追問缺的欄位（例如下車點）；**未填時間不必追問**（後端會預設為「現在」）。
 
 【回覆長度（v0.7.7：情境式，禁止一律罐頭）】
 - **客人只在補地址／時間／人數、語句單純**：reply 維持精簡（約 ${REPLY_TARGET_MIN}～${REPLY_MAX_CHARS} 字），例如「收到，幫您派車」這類自然短句即可。
@@ -127,7 +127,7 @@ ${activeOrderBlock || "（無）"}
 【地址絕對嚴謹（司機保護，強制）】
 - 你必須盡力將上車地址補成「縣市＋行政區＋路名／門牌或明確地標」。只寫常見路名且無上下文時才視為不合格。
 - 禁止亂猜，但允許依服務區優先與台灣地理常識補全雙北唯一路名。若真的無法補全，只能極簡追問：「請問哪一區？」
-- 在「地址含行政區」與「時間具體」同時成立前，嚴禁說已派車/已安排司機/司機要到了等誤導語。
+- 在「地址含行政區」未補齊前，嚴禁說已派車/已安排司機/司機要到了等誤導語。未填時間時後端會視為「現在」，不得用缺時間阻止派車敘述。
 - 嚴格禁語：reply 嚴禁出現「請問是哪一區」「請問是哪一個區」「這樣司機才不會跑錯喔」「為了避免司機跑錯」「再麻煩提供一下喔」等機械式廢話。若資訊殘缺到無法補全，只能回「請問哪一區？」或「請補門牌或地標。」。
 
 【機場與里程計費（口徑固定）】
@@ -326,9 +326,9 @@ function suppressAddressReaskWhenPickupVerified(reply, pickup_verified, draft) {
   if (!reask) return t;
   const missingDropoff = !String(draft?.dropoff ?? "").trim() || String(draft?.dropoff ?? "").trim() === "—";
   const missingTime = !String(draft?.time ?? "").trim();
-  if (missingDropoff && missingTime) return "好的，上車點我記下了～再給我下車地點跟時間就行。";
+  if (missingDropoff && missingTime) return "好的，上車點我記下了～再給我下車地點就行。";
   if (missingDropoff) return "好的，上車點我記下了～下車要到哪裡呢？";
-  if (missingTime) return "好的，上車點我記下了～想幾點搭車呢？";
+  if (missingTime) return "好的，上車點我記下了～我這邊幫你整理。";
   return "好的，上車點我記下了～我這邊幫你整理。";
 }
 
@@ -926,6 +926,10 @@ export async function parseOrderFromText(messageText, options = {}) {
           const aiDeclaredFake = Boolean(obj.is_fake) || heuristicFake;
           const aiSaysPickupVerified = Boolean(obj.pickup_verified);
           let { pickup_verified, time_clear } = finalizePickupDispatchGate(obj, draft, heuristicFake);
+          if (pickup_verified && !String(draft.time ?? "").trim()) {
+            draft.time = "現在";
+            time_clear = true;
+          }
 
           // ===== 特殊需求（休旅/雙B）：完全以本則明確關鍵字為準，忽略模型輸出 =====
           const allowedVehicleTypes = new Set(["suv", "double_b", "suv_double_b", "specified"]);
@@ -949,7 +953,7 @@ export async function parseOrderFromText(messageText, options = {}) {
 
           let reply =
             String(obj.reply ?? "").trim() ||
-            "收到，請補縣市區、路名門牌，再加希望時間，謝謝。";
+            "收到，請補縣市區、路名門牌，謝謝。";
 
           // 若只有路名（無行政區），且 AI 已認為可核實、非假資，才補固定追問；其餘一律保留 AI reply。
           const pickupHasAdminMarker = /(區|鄉|鎮|市)/.test(String(draft.pickup ?? ""));
