@@ -16,7 +16,8 @@ import {
   getGoogleShortestRouteEstimate,
   estimateAirportFlatFareByKb,
   finalizeCustomerFareReply,
-  looksLikePricingQuestion
+  looksLikePricingQuestion,
+  isConcreteCustomerPickupTime
 } from "./utils/ai_v7.js";
 
 console.log("[boot] server.js", {
@@ -270,7 +271,7 @@ async function loadAlarmsDb() {
 
 async function saveAlarmsDb() {
   const out = {
-    version: "0.7.18",
+    version: "0.7.19",
     alarms: alarmsDb.alarms || {},
     waiting_dispatches: alarmsDb.waiting_dispatches || {}
   };
@@ -286,13 +287,16 @@ async function upsertAlarmRecord(record) {
 /** 派單廣播前強制持久化；失敗則不可對司機群發送格式。 */
 async function persistDispatchSnapshot(order, merged, finalBlock) {
   await loadAlarmsDb();
-  const forcedToday = todayYmdTaipei();
-  order.date = forcedToday;
   const safeMerged = forceDispatchDraftToday(merged);
-  const safeFinalBlock = forceDispatchBlockToday(buildAcceleratedDispatchFormat(safeMerged));
+  const mergedDateRaw = String(safeMerged.date ?? "").trim();
+  const persistDateYmd = mergedDateRaw
+    ? orderBookingYmd({ date: mergedDateRaw, rideTimestampMs: null, createdAt: Date.now() }) || todayYmdTaipei()
+    : String(order.date ?? "").trim() || todayYmdTaipei();
+  order.date = persistDateYmd;
+  const safeFinalBlock = forceDispatchBlockToday(buildAcceleratedDispatchFormat(safeMerged), persistDateYmd);
   const lockedFinalBlock =
     hasDispatchCardSent(order) && String(order.formText ?? "").trim()
-      ? forceDispatchBlockToday(order.formText)
+      ? forceDispatchBlockToday(order.formText, persistDateYmd)
       : safeFinalBlock;
   alarmsDb.waiting_dispatches = alarmsDb.waiting_dispatches || {};
   alarmsDb.waiting_dispatches[order.orderId] = {
@@ -300,7 +304,7 @@ async function persistDispatchSnapshot(order, merged, finalBlock) {
     customerId: order.customerId,
     pickup: String(order.pickup ?? ""),
     dropoff: String(order.dropoff ?? ""),
-    date: forcedToday,
+    date: persistDateYmd,
     time: String(order.time ?? ""),
     estimated_fare_text: String(safeMerged.estimated_fare_text ?? ""),
     finalBlock: lockedFinalBlock,
@@ -625,7 +629,17 @@ async function handleEvent(event) {
             mergeDispatchDraft(buildContextDraftForAi(userId), aiTime.draft)
           );
           if (nextDraft.time) active.time = nextDraft.time;
-          active.date = todayYmdTaipei();
+          const nd = String(nextDraft.date ?? "").trim();
+          if (nd) {
+            active.date =
+              orderBookingYmd({ date: nd, rideTimestampMs: null, createdAt: Date.now() }) || todayYmdTaipei();
+          } else if (aiTime?.ride_timestamp) {
+            const iso = normalizeRideTimestampYearTo2026(aiTime.ride_timestamp);
+            const rideMs = iso ? Date.parse(iso) : NaN;
+            if (Number.isFinite(rideMs)) {
+              active.date = taipeiYmdFromInstantMs(rideMs);
+            }
+          }
           if (aiTime?.ride_timestamp) {
             active.rideTimestamp = normalizeRideTimestampYearTo2026(aiTime.ride_timestamp);
             active.rideTimestampMs = active.rideTimestamp ? Date.parse(active.rideTimestamp) : NaN;
@@ -729,8 +743,16 @@ async function handleEvent(event) {
 
       const pickupBlockReason = pickupEmptyBlockReason(merged.pickup);
       const hasPickupCandidate = !pickupBlockReason && Boolean(merged.pickup?.trim());
+      const scheduleReady = draftHasDispatchableSchedule(merged, ai);
       // v0.7.11：AI 只萃取上車文字；盲派前的最終可派判定必須由 Google Maps API 完成。
-      const driverReady = Boolean(ai?.ride_related) && hasPickupCandidate;
+      const driverReady = Boolean(ai?.ride_related) && hasPickupCandidate && scheduleReady;
+
+      if (Boolean(ai?.ride_related) && hasPickupCandidate && !scheduleReady) {
+        const msg = "請補充您的預計上車時間";
+        await reply(replyToken, msg);
+        appendConversationTurn(userId, "assistant", msg);
+        return;
+      }
 
       if (driverReady) {
         const activeForDispatch = getActiveOrder(userId);
@@ -1037,6 +1059,17 @@ function normalizeRideTimestampYearTo2026(ts) {
   return s;
 }
 
+/** 具體可派車時間：草稿時間欄或 AI ride_timestamp（客群派車閘門用）。 */
+function draftHasDispatchableSchedule(merged, ai) {
+  if (isConcreteCustomerPickupTime(merged?.time)) return true;
+  const raw = ai?.ride_timestamp || merged?.ride_timestamp;
+  if (!raw) return false;
+  const n = normalizeRideTimestampYearTo2026(String(raw));
+  if (!n) return false;
+  const ms = Date.parse(n);
+  return Number.isFinite(ms);
+}
+
 function clearAlarm(orderId) {
   const key = String(orderId ?? "");
   if (!key) return;
@@ -1185,7 +1218,15 @@ function createOrderId() {
 function createOrder(customerId, form) {
   const orderId = createOrderId();
   const normalizedRideTimestamp = normalizeRideTimestampYearTo2026(form.ride_timestamp);
-  const forcedToday = todayYmdTaipei();
+  const formDateRaw = String(form?.date ?? "").trim();
+  let orderDateYmd = todayYmdTaipei();
+  if (formDateRaw) {
+    const y = orderBookingYmd({ date: formDateRaw, rideTimestampMs: null, createdAt: Date.now() });
+    if (y) orderDateYmd = y;
+  } else if (normalizedRideTimestamp) {
+    const rideMs = Date.parse(normalizedRideTimestamp);
+    if (Number.isFinite(rideMs)) orderDateYmd = taipeiYmdFromInstantMs(rideMs);
+  }
   const newOrder = {
     orderId,
     status: "waiting",
@@ -1193,7 +1234,7 @@ function createOrder(customerId, form) {
     address: form.pickup,
     pickup: form.pickup,
     dropoff: form.dropoff,
-    date: forcedToday,
+    date: orderDateYmd,
     time: form.time,
     passengers: form.passengers || null,
     formText: form.rawText,
@@ -1234,15 +1275,29 @@ function todayYmdTaipei(d = new Date()) {
   }).format(d);
 }
 
-function forceDispatchDraftToday(draft) {
-  return { ...(draft || {}), date: todayYmdTaipei() };
+function taipeiYmdFromInstantMs(ms) {
+  if (!Number.isFinite(ms)) return todayYmdTaipei();
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Taipei",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).format(new Date(ms));
 }
 
-function forceDispatchBlockToday(block) {
-  const today = todayYmdTaipei();
+/** 僅在草稿無日期時補「今天」；客人已給日期（含明天）一律保留。 */
+function forceDispatchDraftToday(draft) {
+  const out = { ...(draft || {}) };
+  if (!String(out.date ?? "").trim()) out.date = todayYmdTaipei();
+  return out;
+}
+
+/** 將派車卡內「日期：」列與指定 YYYY-MM-DD 對齊（預設今天）。 */
+function forceDispatchBlockToday(block, dateYmd = null) {
+  const ymd = dateYmd || todayYmdTaipei();
   const s = String(block ?? "");
   if (!s.trim()) return s;
-  if (/日期：.*/.test(s)) return s.replace(/日期：.*/g, `日期：${today}`);
+  if (/日期：.*/.test(s)) return s.replace(/日期：.*/g, `日期：${ymd}`);
   return s;
 }
 
@@ -1275,7 +1330,12 @@ async function pushDispatchCardOnce(order, merged, finalBlock) {
       pickup_verified_source: "google_maps"
     };
   }
-  const safeFinalBlock = forceDispatchBlockToday(finalBlock);
+  const mergedDr = String(safeMerged.date ?? "").trim();
+  const cardDateYmd = mergedDr
+    ? orderBookingYmd({ date: mergedDr, rideTimestampMs: null, createdAt: Date.now() }) || todayYmdTaipei()
+    : String(order.date ?? "").trim() || todayYmdTaipei();
+  order.date = cardDateYmd;
+  const safeFinalBlock = forceDispatchBlockToday(finalBlock, cardDateYmd);
   order.dispatchCardSent = true;
   order.dispatchCardSentAtMs = Date.now();
   order.formText = safeFinalBlock;
@@ -1328,6 +1388,14 @@ function orderBookingYmd(order) {
     month: "2-digit",
     day: "2-digit"
   }).format(new Date(order.createdAt));
+}
+
+/** 派車卡／訂單日期列：有客人日期則正規化為 YYYY-MM-DD，否則為今日。 */
+function normalizedDispatchCardDateYmd(draftLike) {
+  const raw = String(draftLike?.date ?? "").trim();
+  if (!raw) return todayYmdTaipei();
+  const y = orderBookingYmd({ date: raw, rideTimestampMs: null, createdAt: Date.now() });
+  return y || todayYmdTaipei();
 }
 
 /** 僅「預約日／發車日為今日（台北日曆）」的 waiting 單，供喊單／標記綁定。 */
@@ -1510,7 +1578,7 @@ function buildContextDraftForAi(userId) {
   const active = getActiveOrder(userId);
   if (!active) return prev;
   return mergeDispatchDraft(prev, {
-    date: todayYmdTaipei(),
+    date: String(active.date ?? prev.date ?? "").trim() || todayYmdTaipei(),
     time: String(active.time ?? prev.time ?? "").trim(),
     pickup: String(active.pickup || active.address || prev.pickup || "").trim(),
     dropoff: String(active.dropoff ?? prev.dropoff ?? "").trim(),
@@ -1527,7 +1595,7 @@ function buildActiveOrderContextForAi(userId) {
     pickup: active.pickup || active.address || "",
     dropoff: active.dropoff || "",
     time: active.time || "",
-    date: todayYmdTaipei(),
+    date: String(active.date ?? "").trim() || todayYmdTaipei(),
     passengers: active.passengers || ""
   };
 }
@@ -1538,10 +1606,10 @@ function applyMergedToWaitingOrder(order, merged, finalBlock) {
   order.address = order.pickup;
   order.dropoff = String(merged.dropoff ?? "").trim() || order.dropoff;
   order.time = String(merged.time ?? "").trim() || order.time;
-  order.date = safeMerged.date;
+  order.date = normalizedDispatchCardDateYmd(safeMerged);
   order.passengers = merged.passengers || order.passengers;
   if (!hasDispatchCardSent(order)) {
-    order.formText = forceDispatchBlockToday(finalBlock);
+    order.formText = forceDispatchBlockToday(finalBlock, normalizedDispatchCardDateYmd(safeMerged));
   }
   order.estimatedRouteKm = merged.estimated_route_km ?? order.estimatedRouteKm;
   order.estimatedRouteFare = merged.estimated_route_fare ?? order.estimatedRouteFare;
@@ -1668,21 +1736,6 @@ function pickupEmptyBlockReason(pickup) {
   return null;
 }
 
-function serverTimeLooksConcrete(time) {
-  const t = String(time ?? "").trim();
-  if (t.length < 2) return false;
-  if (
-    /待會|等等|稍後|不確定|隨時|儘快|越快越好|看一下|再說|晚點|等等看|不曉得|不知道|可能|大概|應該|之後|有空|方便時/.test(
-      t
-    )
-  ) {
-    return false;
-  }
-  if (/\d/.test(t)) return true;
-  if (/現在|立刻|馬上|立即|當下|隨時可走/.test(t)) return true;
-  return false;
-}
-
 function stripDispatchMisleadingPhrases(text) {
   let t = String(text ?? "").trim();
   if (!t) return "";
@@ -1723,7 +1776,7 @@ function displayDispatchField(v) {
 }
 
 function buildAcceleratedDispatchFormat(d) {
-  const forcedToday = todayYmdTaipei();
+  const dateLine = normalizedDispatchCardDateYmd(d);
   const surcharge = Number(d.fare_surcharge ?? 0) || 0;
   const vtype = String(d.vehicle_request_type ?? "").trim();
   const vLabel = vtype === "suv" ? "休旅" : vtype === "double_b" ? "雙B" : vtype === "suv_double_b" ? "休旅/雙B" : "";
@@ -1737,7 +1790,7 @@ function buildAcceleratedDispatchFormat(d) {
   const needLine = `車型/需求：${vLabel || "一般"}`;
   return `❤️‍🔥加速派車格式❤️‍🔥
 
-日期：${displayDispatchField(forcedToday)}
+日期：${displayDispatchField(dateLine)}
 時間：${displayDispatchField(d.time)}
 上車：${displayDispatchField(d.pickup)}
 下車：${displayDispatchField(d.dropoff)}
@@ -1777,7 +1830,7 @@ function draftToRideForm(d, rawText) {
     estimated_route_source,
     is_fake,
     ride_timestamp,
-    rawText: forceDispatchBlockToday(rawText)
+    rawText: forceDispatchBlockToday(rawText, normalizedDispatchCardDateYmd(safeDraft))
   };
 }
 

@@ -155,7 +155,7 @@ ${kbFareHint ? kbFareHint : "（本則尚未由系統預先命中 KB 定額；�
 - 以司機用導航能否在台灣精準到點思考；但你不做最終地圖判定。
 - pickup_verified=true 只可在客人文字看起來足以送 Google Maps 驗證時使用；模糊、重名、缺縣市區 → false，reply 只能極簡追問：「請問哪一區？」
 - 地圖是否存在由 server.js 判定；你不要自行宣稱「地圖已找到」。
-- time_clear：時間具體可派車且寫入 draft.time 才 true；pickup_verified=false 則 time_clear 必 false。
+- time_clear：時間具體可派車且寫入 draft.time，且為**具體可派時間**（含數字時刻或現在/立刻等），**不得**僅因 AI 標 true 就放行；pickup_verified=false 則 time_clear 必 false。
 
 【發送門檻對齊（v0.7.14 極速盲派 + Google Maps 安全鎖；v0.7.16 司機黑話不得誤觸；v0.7.17 地圖回傳地址 server 端清洗）】
 - server.js 只要萃取到上車點候選，會先呼叫 Google Maps API 實體驗證；只要 Google Maps 回傳 status=OK，即視為地圖上找得到，才建立訂單並向司機群發送唯一一次派車卡。
@@ -624,6 +624,25 @@ function isOnlyRoadWithoutDistrict(pickup) {
 }
 
 /**
+ * 客人預計上車時間是否具體可派（與 server 派車閘門對齊）。
+ * 純模糊口語（待會、等等）或過短字串視為無效。
+ */
+export function isConcreteCustomerPickupTime(time) {
+  const t = String(time ?? "").trim();
+  if (t.length < 2) return false;
+  if (
+    /待會|等等|稍後|不確定|隨時|儘快|越快越好|看一下|再說|晚點|等等看|不曉得|不知道|可能|大概|應該|之後|有空|方便時/.test(
+      t
+    )
+  ) {
+    return false;
+  }
+  if (/\d/.test(t)) return true;
+  if (/現在|立刻|馬上|立即|當下|隨時可走/.test(t)) return true;
+  return false;
+}
+
+/**
  * AI 優先：若 AI 判定 is_fake，或 pickup_verified 為 false，則不可派車（不因字面上有「區」而放行）。
  * 僅在「非假資且 AI 聲稱 pickup_verified」時，才允許以結構規則向下加嚴（絕不將 false 改成 true）。
  * @param {Record<string, unknown>} obj AI 原始 JSON
@@ -643,7 +662,7 @@ export function finalizePickupDispatchGate(obj, draft, heuristicFake = false) {
   }
 
   let pickup_verified = aiSaysPickupVerified && Boolean(pickupText);
-  let time_clear = aiSaysTimeClear && Boolean(timeText);
+  let time_clear = aiSaysTimeClear && Boolean(timeText) && isConcreteCustomerPickupTime(timeText);
   if (time_clear && !pickup_verified) time_clear = false;
 
   if (pickup_verified && !hasAdminDistrict(pickupText)) {
