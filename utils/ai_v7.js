@@ -1096,6 +1096,7 @@ function isMultipleOf5(n) {
  * 解析司機喊單訊息
  * - 預約單：允許喊「準」
  * - 即時單：允許喊數字分鐘（需為 5 的倍數）
+ * - 排除門牌／樓層等：「號樓弄巷Ff段線」前的阿拉伯數字不當分鐘；支援「10分」「15分鐘」
  */
 export function parseRsDriverBid(text) {
   const raw = String(text ?? "").trim();
@@ -1105,9 +1106,26 @@ export function parseRsDriverBid(text) {
     return { kind: "ready" };
   }
 
-  // 支援「信義10」「新店 15」「我10」等：取最後一段數字
-  const m = raw.match(/(\d{1,3})\s*$/);
+  if (/(?:⬇️|\u2B07\uFE0F?|(?:客\s*)?下)\s*[0-9]+(?:\.[0-9]+)?\s*\/\s*[0-9]+(?:\.[0-9]+)?/u.test(raw)) {
+    return { kind: "unknown" };
+  }
+
+  const explicitMin = raw.match(/(\d{1,3})\s*分鐘\s*$/u) || raw.match(/(\d{1,3})\s*分\s*$/u);
+  if (explicitMin) {
+    const minutes = parseIntSafe(explicitMin[1]);
+    if (minutes != null) return { kind: "minutes", minutes };
+  }
+
+  let s = raw;
+  while (/\d{1,4}\s*[號樓弄巷Ff段線]\s*$/u.test(s)) {
+    s = s.replace(/\d{1,4}\s*[號樓弄巷Ff段線]\s*$/u, "").trim();
+  }
+
+  const m = s.match(/(\d{1,3})\s*$/);
   if (m) {
+    const idx = s.length - m[0].length;
+    const charBefore = idx > 0 ? s[idx - 1] : "";
+    if (/[號樓弄巷Ff段線]/.test(charBefore)) return { kind: "unknown" };
     const minutes = parseIntSafe(m[1]);
     if (minutes == null) return { kind: "unknown" };
     return { kind: "minutes", minutes };
@@ -1204,13 +1222,29 @@ export function parseRsDispatcherMark(text) {
 export function parseRsStateSignal(text) {
   const t = String(text ?? "").trim();
   if (!t) return { kind: "unknown" };
-  if (t.includes("到")) return { kind: "arrived" };
-  if (t.includes("客上")) return { kind: "onboard" };
 
-  const m = t.match(/客下\s*([0-9]+(?:\.[0-9]+)?)\s*\/\s*([0-9]+(?:\.[0-9]+)?)/);
-  if (m) {
-    return { kind: "dropoff", km: Number(m[1]), fare: Number(m[2]) };
+  const dropModern = t.match(
+    /(?:⬇️|\u2B07\uFE0F?|(?:客\s*)?下)\s*([0-9]+(?:\.[0-9]+)?)\s*\/\s*([0-9]+(?:\.[0-9]+)?)/u
+  );
+  const dropLegacy = dropModern ? null : t.match(/客下\s*([0-9]+(?:\.[0-9]+)?)\s*\/\s*([0-9]+(?:\.[0-9]+)?)/);
+  const dm = dropModern || dropLegacy;
+  if (dm) {
+    const km = Number(dm[1]);
+    const fare = Number(dm[2]);
+    if (Number.isFinite(km) && km > 0 && Number.isFinite(fare) && fare > 0) {
+      return { kind: "dropoff", km, fare };
+    }
   }
+
+  if (/客上|上車|⬆️|\u2B06\uFE0F?|貨上人不上/.test(t)) {
+    return { kind: "onboard" };
+  }
+  const hasBlockedXia = t.includes("下") && !/貨上人不上/.test(t);
+  if (!hasBlockedXia && /(^|[\s，,、])上([\s，,、]|$)/u.test(t)) {
+    return { kind: "onboard" };
+  }
+
+  if (t.includes("到")) return { kind: "arrived" };
   return { kind: "unknown" };
 }
 

@@ -270,7 +270,7 @@ async function loadAlarmsDb() {
 
 async function saveAlarmsDb() {
   const out = {
-    version: "0.7.17",
+    version: "0.7.18",
     alarms: alarmsDb.alarms || {},
     waiting_dispatches: alarmsDb.waiting_dispatches || {}
   };
@@ -1394,17 +1394,46 @@ function orderMatchesLocationTokens(order, tokens) {
   return tokens.some((tok) => hay.includes(tok));
 }
 
+function lastBidCreatedAtMs(order) {
+  const bids = order?.rs?.bids;
+  if (!Array.isArray(bids) || !bids.length) return null;
+  let max = 0;
+  for (const b of bids) {
+    const ms = Number(b?.createdAtMs);
+    if (Number.isFinite(ms) && ms > max) max = ms;
+  }
+  return max > 0 ? max : null;
+}
+
 /**
- * 司機群：@ 標記 → 永遠綁最新 waiting；喊單 → 優先比對訊息中的地名與訂單上／下車址（如：南港 ⊆ 台北市南港區）。
+ * 司機群：@ 標記 → 優先綁「最近有人喊單」的 waiting；地名比對 → 優先消化最舊 waiting。
  */
 function getWaitingOrderForDriverMessage(text, { isDispatcherMark }) {
   const waiting = waitingOrdersToday().sort((a, b) => b.createdAt - a.createdAt);
   if (!waiting.length) return null;
-  if (isDispatcherMark) return waiting[0];
+
+  if (isDispatcherMark) {
+    const withBids = waiting.filter((o) => lastBidCreatedAtMs(o) != null);
+    if (withBids.length) {
+      const now = Date.now();
+      withBids.sort((a, b) => {
+        const ga = now - lastBidCreatedAtMs(a);
+        const gb = now - lastBidCreatedAtMs(b);
+        if (ga !== gb) return ga - gb;
+        return a.createdAt - b.createdAt;
+      });
+      return withBids[0];
+    }
+    return waiting[0];
+  }
+
   if (waiting.length === 1) return waiting[0];
   const tokens = extractLocationTokensForBidMatch(text);
   const matched = waiting.filter((o) => orderMatchesLocationTokens(o, tokens));
-  if (matched.length) return matched[0];
+  if (matched.length) {
+    matched.sort((a, b) => a.createdAt - b.createdAt);
+    return matched[0];
+  }
   return waiting[0];
 }
 
@@ -1804,6 +1833,120 @@ async function processDriverFleetGroupMessage(_event, replyToken, userId, text, 
     return;
   }
 
+  const rsState = parseRsStateSignal(text);
+
+  const onboardDropOrder = getDriverOrderByStatus(userId, "onboard");
+  if (onboardDropOrder && rsState.kind === "dropoff") {
+    const check = rsCheckOvercharge({ km: rsState.km, fare: rsState.fare });
+    penaltyTracker.onFareKnown({ orderId: onboardDropOrder.orderId, fare: rsState.fare });
+
+    const baselineFare = Number(onboardDropOrder?.estimatedRouteFare ?? NaN);
+    const baselineKm = Number(onboardDropOrder?.estimatedRouteKm ?? NaN);
+    const baselineValid = Number.isFinite(baselineFare) && baselineFare > 0 && Number.isFinite(baselineKm) && baselineKm > 0;
+    const reportedKm = Number(rsState.km);
+    const reportedFare = Number(rsState.fare);
+    const reportedValid = Number.isFinite(reportedKm) && reportedKm > 0 && Number.isFinite(reportedFare) && reportedFare > 0;
+
+    if (baselineValid && reportedValid) {
+      const diffFare = reportedFare - baselineFare;
+      const kmDeviationRate = Math.abs(reportedKm - baselineKm) / baselineKm;
+      const isAbnormal = diffFare > 30 || kmDeviationRate > 0.2;
+
+      if (isAbnormal) {
+        const prev = abnormalChargingDrivers.get(userId) || { count: 0, lastAtMs: 0 };
+        abnormalChargingDrivers.set(userId, { count: prev.count + 1, lastAtMs: Date.now() });
+
+        await reply(
+          replyToken,
+          `此趟行程費用 ($${reportedFare}) 與系統預估最短里程 ($${baselineFare}) 偏差較大，已轉交由行政人員進行人工審核結單。`
+        );
+
+        const adminMsg =
+          `【異常收費待審】\n` +
+          `司機編號：${userId}\n` +
+          `訂單：${onboardDropOrder.orderId}\n` +
+          `上車：${onboardDropOrder.pickup || onboardDropOrder.address || "未提供"}\n` +
+          `下車：${onboardDropOrder.dropoff || "未提供"}\n` +
+          `系統最短：${baselineKm}km / $${baselineFare}\n` +
+          `司機回報：${reportedKm}km / $${reportedFare}\n` +
+          `差額：$${Math.round(diffFare)}；里程偏差：${Math.round(kmDeviationRate * 100)}%`;
+        if (process.env.ADMIN_GROUP_ID) {
+          await pushText(process.env.ADMIN_GROUP_ID, adminMsg);
+        } else {
+          console.error("[ADMIN_GROUP_ID] unset, admin message:", adminMsg);
+        }
+
+        await appendLogicErrorLog({
+          title: "司機異常收費：差額>30或里程偏差>20%（真人審核）",
+          driverUserId: userId,
+          orderId: onboardDropOrder.orderId,
+          baselineKm,
+          baselineFare,
+          reportedKm,
+          reportedFare
+        });
+
+        return;
+      }
+    }
+
+    const comp = penaltyTracker.computeCompensation({ orderId: onboardDropOrder.orderId });
+    if (comp) {
+      await reply(
+        replyToken,
+        `強姦成功但遲到：需賠${comp.compensation}（車資3成）給被搶單司機。`
+      );
+    }
+
+    if (!check.ok) {
+      await reply(replyToken, `注意：5/2直走表預估${check.expected}，你填${rsState.fare}疑似溢收+${check.diff}`);
+      return;
+    }
+    await reply(replyToken, `收到，5/2直走表預估${check.expected}，你填${rsState.fare}OK。`);
+    return;
+  }
+
+  const arrivedOnboardOrder = getDriverOrderByStatus(userId, "arrived");
+  if (arrivedOnboardOrder && rsState.kind === "onboard") {
+    arrivedOnboardOrder.status = "onboard";
+
+    await pushText(
+      arrivedOnboardOrder.customerId,
+`✅ 司機已回報您已上車
+感謝您的搭乘 🙏`
+    );
+
+    return;
+  }
+
+  const matchedArrivedOrder = getDriverOrderByStatus(userId, "matched");
+  if (matchedArrivedOrder && rsState.kind === "arrived") {
+    matchedArrivedOrder.status = "arrived";
+    penaltyTracker.onArrived({ orderId: matchedArrivedOrder.orderId, arrivedAtMs: Date.now() });
+
+    if (matchedArrivedOrder.rs?.arrivedTimer) clearTimeout(matchedArrivedOrder.rs.arrivedTimer);
+    matchedArrivedOrder.rs = matchedArrivedOrder.rs || {};
+    matchedArrivedOrder.rs.arrivedTimer = setTimeout(async () => {
+      try {
+        await pushText(
+          matchedArrivedOrder.customerId,
+          "司機已到點，提醒一下：超過5分鐘會開始等候費，1分鐘都是5元喲🥰"
+        );
+      } catch (e) {
+        console.error("[arrivedTimer]", e?.message || e);
+      }
+    }, 5 * 60_000);
+
+    await reply(replyToken, "已通知客人");
+
+    await pushText(
+      matchedArrivedOrder.customerId,
+`📍 司機已抵達，請準備上車`
+    );
+
+    return;
+  }
+
   const dispatcherMark = parseRsDispatcherMark(text);
   const waitingOrder = getWaitingOrderForDriverMessage(text, {
     isDispatcherMark: Boolean(dispatcherMark)
@@ -1914,119 +2057,6 @@ async function processDriverFleetGroupMessage(_event, replyToken, userId, text, 
     await pushText(cardTargetOrder.customerId, text);
     delete pendingDriver[cardTargetOrder.orderId];
 
-    return;
-  }
-
-  const matchedOrder = getDriverOrderByStatus(userId, "matched");
-  if (matchedOrder && text.includes("到")) {
-    matchedOrder.status = "arrived";
-    penaltyTracker.onArrived({ orderId: matchedOrder.orderId, arrivedAtMs: Date.now() });
-
-    if (matchedOrder.rs?.arrivedTimer) clearTimeout(matchedOrder.rs.arrivedTimer);
-    matchedOrder.rs = matchedOrder.rs || {};
-    matchedOrder.rs.arrivedTimer = setTimeout(async () => {
-      try {
-        await pushText(
-          matchedOrder.customerId,
-          "司機已到點，提醒一下：超過5分鐘會開始等候費，1分鐘都是5元喲🥰"
-        );
-      } catch (e) {
-        console.error("[arrivedTimer]", e?.message || e);
-      }
-    }, 5 * 60_000);
-
-    await reply(replyToken, "已通知客人");
-
-    await pushText(
-      matchedOrder.customerId,
-`📍 司機已抵達，請準備上車`
-    );
-
-    return;
-  }
-
-  const arrivedOrder = getDriverOrderByStatus(userId, "arrived");
-  if (arrivedOrder && text.includes("客上")) {
-    arrivedOrder.status = "onboard";
-
-    await pushText(
-      arrivedOrder.customerId,
-`✅ 司機已回報您已上車
-感謝您的搭乘 🙏`
-    );
-
-    return;
-  }
-
-  const onboardOrder = getDriverOrderByStatus(userId, "onboard");
-  const state = parseRsStateSignal(text);
-  if (onboardOrder && state.kind === "dropoff") {
-    const check = rsCheckOvercharge({ km: state.km, fare: state.fare });
-    penaltyTracker.onFareKnown({ orderId: onboardOrder.orderId, fare: state.fare });
-
-    const baselineFare = Number(onboardOrder?.estimatedRouteFare ?? NaN);
-    const baselineKm = Number(onboardOrder?.estimatedRouteKm ?? NaN);
-    const baselineValid = Number.isFinite(baselineFare) && baselineFare > 0 && Number.isFinite(baselineKm) && baselineKm > 0;
-    const reportedKm = Number(state.km);
-    const reportedFare = Number(state.fare);
-    const reportedValid = Number.isFinite(reportedKm) && reportedKm > 0 && Number.isFinite(reportedFare) && reportedFare > 0;
-
-    if (baselineValid && reportedValid) {
-      const diffFare = reportedFare - baselineFare;
-      const kmDeviationRate = Math.abs(reportedKm - baselineKm) / baselineKm;
-      const isAbnormal = diffFare > 30 || kmDeviationRate > 0.2;
-
-      if (isAbnormal) {
-        const prev = abnormalChargingDrivers.get(userId) || { count: 0, lastAtMs: 0 };
-        abnormalChargingDrivers.set(userId, { count: prev.count + 1, lastAtMs: Date.now() });
-
-        await reply(
-          replyToken,
-          `此趟行程費用 ($${reportedFare}) 與系統預估最短里程 ($${baselineFare}) 偏差較大，已轉交由行政人員進行人工審核結單。`
-        );
-
-        const adminMsg =
-          `【異常收費待審】\n` +
-          `司機編號：${userId}\n` +
-          `訂單：${onboardOrder.orderId}\n` +
-          `上車：${onboardOrder.pickup || onboardOrder.address || "未提供"}\n` +
-          `下車：${onboardOrder.dropoff || "未提供"}\n` +
-          `系統最短：${baselineKm}km / $${baselineFare}\n` +
-          `司機回報：${reportedKm}km / $${reportedFare}\n` +
-          `差額：$${Math.round(diffFare)}；里程偏差：${Math.round(kmDeviationRate * 100)}%`;
-        if (process.env.ADMIN_GROUP_ID) {
-          await pushText(process.env.ADMIN_GROUP_ID, adminMsg);
-        } else {
-          console.error("[ADMIN_GROUP_ID] unset, admin message:", adminMsg);
-        }
-
-        await appendLogicErrorLog({
-          title: "司機異常收費：差額>30或里程偏差>20%（真人審核）",
-          driverUserId: userId,
-          orderId: onboardOrder.orderId,
-          baselineKm,
-          baselineFare,
-          reportedKm,
-          reportedFare
-        });
-
-        return;
-      }
-    }
-
-    const comp = penaltyTracker.computeCompensation({ orderId: onboardOrder.orderId });
-    if (comp) {
-      await reply(
-        replyToken,
-        `強姦成功但遲到：需賠${comp.compensation}（車資3成）給被搶單司機。`
-      );
-    }
-
-    if (!check.ok) {
-      await reply(replyToken, `注意：5/2直走表預估${check.expected}，你填${state.fare}疑似溢收+${check.diff}`);
-      return;
-    }
-    await reply(replyToken, `收到，5/2直走表預估${check.expected}，你填${state.fare}OK。`);
     return;
   }
 
