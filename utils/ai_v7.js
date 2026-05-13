@@ -155,7 +155,7 @@ ${kbFareHint ? kbFareHint : "（本則尚未由系統預先命中 KB 定額；�
 - 以司機用導航能否在台灣精準到點思考；但你不做最終地圖判定。
 - pickup_verified=true 只可在客人文字看起來足以送 Google Maps 驗證時使用；模糊、重名、缺縣市區 → false，reply 只能極簡追問：「請問哪一區？」
 - 地圖是否存在由 server.js 判定；你不要自行宣稱「地圖已找到」。
-- time_clear：時間具體可派車且寫入 draft.time，且為**具體可派時間**（含數字時刻或現在/立刻等），**不得**僅因 AI 標 true 就放行；pickup_verified=false 則 time_clear 必 false。
+- time_clear：客人已給出可派車時間（具體時刻或「現在／立刻」等），或**尚未填時間**（後端會預設為現在，不得因此擋派車）；pickup_verified=false 則 time_clear 必 false。
 
 【發送門檻對齊（v0.7.14 極速盲派 + Google Maps 安全鎖；v0.7.16 司機黑話不得誤觸；v0.7.17 地圖回傳地址 server 端清洗）】
 - server.js 只要萃取到上車點候選，會先呼叫 Google Maps API 實體驗證；只要 Google Maps 回傳 status=OK，即視為地圖上找得到，才建立訂單並向司機群發送唯一一次派車卡。
@@ -662,7 +662,9 @@ export function finalizePickupDispatchGate(obj, draft, heuristicFake = false) {
   }
 
   let pickup_verified = aiSaysPickupVerified && Boolean(pickupText);
-  let time_clear = aiSaysTimeClear && Boolean(timeText) && isConcreteCustomerPickupTime(timeText);
+  const timeOk =
+    !timeText || isConcreteCustomerPickupTime(timeText);
+  let time_clear = aiSaysTimeClear && timeOk;
   if (time_clear && !pickup_verified) time_clear = false;
 
   if (pickup_verified && !hasAdminDistrict(pickupText)) {
@@ -1118,7 +1120,10 @@ function isMultipleOf5(n) {
  * - 排除門牌／樓層等：「號樓弄巷Ff段線」前的阿拉伯數字不當分鐘；支援「10分」「15分鐘」
  */
 export function parseRsDriverBid(text) {
-  const raw = String(text ?? "").trim();
+  let raw = String(text ?? "").trim();
+  while (/^@\S+\s+/.test(raw)) {
+    raw = raw.replace(/^@\S+\s+/, "").trim();
+  }
   if (!raw) return { kind: "unknown" };
 
   if (/^準$/.test(raw)) {

@@ -4,7 +4,8 @@
 import assert from "node:assert/strict";
 import {
   finalizePickupDispatchGate,
-  looksLikePromptFictionPickupHint
+  looksLikePromptFictionPickupHint,
+  parseRsDriverBid
 } from "./ai_v7.js";
 
 function test(name, fn) {
@@ -61,6 +62,23 @@ test("板橋區文化路：AI 判定不可核實時必須尊重（不因字面�
   );
   assert.equal(gate.pickup_verified, false);
   assert.equal(gate.time_clear, false);
+});
+
+test("板橋區文化路：未填時間時仍可依 AI 標記放行 time_clear（後端預設現在）", () => {
+  const draft = { pickup: "板橋區文化路一段100號", time: "" };
+  const gate = finalizePickupDispatchGate(
+    { is_fake: false, pickup_verified: true, time_clear: true },
+    draft,
+    false
+  );
+  assert.equal(gate.pickup_verified, true);
+  assert.equal(gate.time_clear, true);
+});
+
+test("parseRsDriverBid：略過開頭 @標記後仍解析尾端分鐘", () => {
+  const bid = parseRsDriverBid("@演示機one 萬華10");
+  assert.equal(bid.kind, "minutes");
+  assert.equal(bid.minutes, 10);
 });
 
 if (process.exitCode) {

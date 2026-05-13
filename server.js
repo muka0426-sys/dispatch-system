@@ -16,8 +16,7 @@ import {
   getGoogleShortestRouteEstimate,
   estimateAirportFlatFareByKb,
   finalizeCustomerFareReply,
-  looksLikePricingQuestion,
-  isConcreteCustomerPickupTime
+  looksLikePricingQuestion
 } from "./utils/ai_v7.js";
 
 console.log("[boot] server.js", {
@@ -271,7 +270,7 @@ async function loadAlarmsDb() {
 
 async function saveAlarmsDb() {
   const out = {
-    version: "0.7.19",
+    version: "0.7.20",
     alarms: alarmsDb.alarms || {},
     waiting_dispatches: alarmsDb.waiting_dispatches || {}
   };
@@ -602,6 +601,7 @@ async function handleEvent(event) {
       }
 
       // v0.3.2：修改時間意圖 → 清除舊 alarm，更新 rideTimestamp 後重設 alarm
+      // v0.7.20：客人未給新時間時不追問，草稿時間預設為現在；已媒合改時間改推司機主群。
       const modifyTimeIntent =
         /改時間|修改時間|更改時間|延後|提前|改到|改成|挪到/.test(text) && getActiveOrder(userId);
       if (modifyTimeIntent) {
@@ -623,71 +623,77 @@ async function handleEvent(event) {
           now: currentDateTime
         });
 
-        if (aiTime?.ride_timestamp || aiTime?.draft?.time) {
-          const beforeTime = active.time || "";
-          const nextDraft = forceDispatchDraftToday(
-            mergeDispatchDraft(buildContextDraftForAi(userId), aiTime.draft)
-          );
-          if (nextDraft.time) active.time = nextDraft.time;
-          const nd = String(nextDraft.date ?? "").trim();
-          if (nd) {
-            active.date =
-              orderBookingYmd({ date: nd, rideTimestampMs: null, createdAt: Date.now() }) || todayYmdTaipei();
-          } else if (aiTime?.ride_timestamp) {
-            const iso = normalizeRideTimestampYearTo2026(aiTime.ride_timestamp);
-            const rideMs = iso ? Date.parse(iso) : NaN;
-            if (Number.isFinite(rideMs)) {
-              active.date = taipeiYmdFromInstantMs(rideMs);
-            }
+        const beforeTime = String(active.time ?? "").trim();
+        const nextDraft = ensureCustomerPickupTimeDefaultNow(
+          forceDispatchDraftToday(mergeDispatchDraft(buildContextDraftForAi(userId), aiTime?.draft || {}))
+        );
+        active.time = String(nextDraft.time ?? "").trim() || active.time;
+        const nd = String(nextDraft.date ?? "").trim();
+        if (nd) {
+          active.date =
+            orderBookingYmd({ date: nd, rideTimestampMs: null, createdAt: Date.now() }) || todayYmdTaipei();
+        } else if (aiTime?.ride_timestamp) {
+          const iso = normalizeRideTimestampYearTo2026(aiTime.ride_timestamp);
+          const rideMs = iso ? Date.parse(iso) : NaN;
+          if (Number.isFinite(rideMs)) {
+            active.date = taipeiYmdFromInstantMs(rideMs);
           }
-          if (aiTime?.ride_timestamp) {
-            active.rideTimestamp = normalizeRideTimestampYearTo2026(aiTime.ride_timestamp);
-            active.rideTimestampMs = active.rideTimestamp ? Date.parse(active.rideTimestamp) : NaN;
-          }
-          if (Number.isFinite(active.rideTimestampMs) && active.isFake && active.date) {
-            await scheduleFakeReservationAlert(active);
-          }
+        }
+        if (aiTime?.ride_timestamp) {
+          active.rideTimestamp = normalizeRideTimestampYearTo2026(aiTime.ride_timestamp);
+          active.rideTimestampMs = active.rideTimestamp ? Date.parse(active.rideTimestamp) : NaN;
+        }
+        if (Number.isFinite(active.rideTimestampMs) && active.isFake && active.date) {
+          await scheduleFakeReservationAlert(active);
+        }
 
-          setDispatchDraft(userId, nextDraft);
+        setDispatchDraft(userId, nextDraft);
 
-          if (active.status === "waiting") {
-            const finalBlock = buildAcceleratedDispatchFormat(nextDraft);
-            if (!hasDispatchCardSent(active)) active.formText = finalBlock;
-            try {
-              await persistDispatchSnapshot(active, nextDraft, finalBlock);
-            } catch (e) {
-              console.error("[persistDispatchSnapshot]", e?.message || e);
-              const failMsg = "系統存檔失敗，更新未送出，請稍後再試。";
-              await reply(replyToken, failMsg);
-              appendConversationTurn(userId, "assistant", failMsg);
-              return;
-            }
-
-            clearPendingDispatchConfirmation(userId);
-            const msg = "收到，時間已更新。";
-            await reply(replyToken, msg);
-            appendConversationTurn(userId, "assistant", msg);
+        if (active.status === "waiting") {
+          const finalBlock = buildAcceleratedDispatchFormat(nextDraft);
+          if (!hasDispatchCardSent(active)) active.formText = finalBlock;
+          try {
+            await persistDispatchSnapshot(active, nextDraft, finalBlock);
+          } catch (e) {
+            console.error("[persistDispatchSnapshot]", e?.message || e);
+            const failMsg = "系統存檔失敗，更新未送出，請稍後再試。";
+            await reply(replyToken, failMsg);
+            appendConversationTurn(userId, "assistant", failMsg);
             return;
           }
 
-          if ((active.status === "matched" || active.status === "arrived") && active.driverId && beforeTime !== active.time) {
-            const dname = getDriverDisplayName(active.driverId);
-            await pushText(DRIVER_GROUP_ID, `@${dname} 客人更新資訊：時間改為${active.time}`);
-            const msg = "好的，已幫您通知司機。";
-            await reply(replyToken, msg);
-            appendConversationTurn(userId, "assistant", msg);
-            return;
-          }
-
+          clearPendingDispatchConfirmation(userId);
           const msg = "收到，時間已更新。";
           await reply(replyToken, msg);
           appendConversationTurn(userId, "assistant", msg);
           return;
         }
 
-        const msg2 = "收到，要改到哪天幾點呢？";
-        await reply(replyToken, msg2);
-        appendConversationTurn(userId, "assistant", msg2);
+        const afterTime = String(active.time ?? "").trim();
+        if (active.status === "matched" && active.driverId && beforeTime !== afterTime) {
+          const dname = getDriverDisplayName(active.driverId);
+          const adminGid = (process.env.ADMIN_GROUP_ID || "").trim();
+          if (adminGid) {
+            await pushText(adminGid, `@${dname} 客人改時間為 ${afterTime}，請那個時間前到即可`);
+          }
+          const msg = "好的，已幫您通知司機。";
+          await reply(replyToken, msg);
+          appendConversationTurn(userId, "assistant", msg);
+          return;
+        }
+
+        if (active.status === "arrived" && active.driverId && beforeTime !== afterTime) {
+          const dname = getDriverDisplayName(active.driverId);
+          await pushText(DRIVER_GROUP_ID, `@${dname} 客人更新資訊：時間改為${afterTime}`);
+          const msg = "好的，已幫您通知司機。";
+          await reply(replyToken, msg);
+          appendConversationTurn(userId, "assistant", msg);
+          return;
+        }
+
+        const msg = "收到，時間已更新。";
+        await reply(replyToken, msg);
+        appendConversationTurn(userId, "assistant", msg);
         return;
       }
 
@@ -705,6 +711,7 @@ async function handleEvent(event) {
       let merged = contextDraft;
       if (ai) {
         merged = mergeDispatchDraft(contextDraft, ai.draft);
+        merged = ensureCustomerPickupTimeDefaultNow(merged);
         setDispatchDraft(userId, merged);
       }
 
@@ -743,16 +750,8 @@ async function handleEvent(event) {
 
       const pickupBlockReason = pickupEmptyBlockReason(merged.pickup);
       const hasPickupCandidate = !pickupBlockReason && Boolean(merged.pickup?.trim());
-      const scheduleReady = draftHasDispatchableSchedule(merged, ai);
       // v0.7.11：AI 只萃取上車文字；盲派前的最終可派判定必須由 Google Maps API 完成。
-      const driverReady = Boolean(ai?.ride_related) && hasPickupCandidate && scheduleReady;
-
-      if (Boolean(ai?.ride_related) && hasPickupCandidate && !scheduleReady) {
-        const msg = "請補充您的預計上車時間";
-        await reply(replyToken, msg);
-        appendConversationTurn(userId, "assistant", msg);
-        return;
-      }
+      const driverReady = Boolean(ai?.ride_related) && hasPickupCandidate;
 
       if (driverReady) {
         const activeForDispatch = getActiveOrder(userId);
@@ -805,6 +804,7 @@ async function handleEvent(event) {
           merged = { ...merged, estimated_route_km: null, estimated_route_fare: null, estimated_route_source: null };
         }
 
+        merged = ensureCustomerPickupTimeDefaultNow(merged);
         merged = forceDispatchDraftToday(merged);
         const finalBlock = buildAcceleratedDispatchFormat(merged);
         const safeLead = finalizeCustomerFareReply(
@@ -826,8 +826,25 @@ async function handleEvent(event) {
         // 一單一卡：已標記成功（matched/arrived）後，乘客補齊或修改 → 不重噴整張卡。
         // 改為通知司機變動內容，並用口語回乘客「已幫你通知司機」。
         if (activeForDispatch && activeForDispatch.status !== "waiting") {
+          merged = ensureCustomerPickupTimeDefaultNow(merged);
           setDispatchDraft(userId, merged);
-          const diff = summarizeOrderChangesForDriver(activeForDispatch, merged);
+          const orderBefore = {
+            pickup: String(activeForDispatch.pickup || activeForDispatch.address || "").trim(),
+            dropoff: String(activeForDispatch.dropoff || "").trim(),
+            time: String(activeForDispatch.time || "").trim(),
+            date: String(activeForDispatch.date || "").trim(),
+            passengers: String(activeForDispatch.passengers || "").trim(),
+            address: String(activeForDispatch.address || "").trim()
+          };
+          applyMergedToActiveDispatchOrder(activeForDispatch, merged);
+          if (ai?.ride_timestamp) {
+            const n = normalizeRideTimestampYearTo2026(ai.ride_timestamp);
+            if (n) {
+              activeForDispatch.rideTimestamp = n;
+              activeForDispatch.rideTimestampMs = Date.parse(n);
+            }
+          }
+          const diff = summarizeOrderChangesForDriver(orderBefore, merged);
           const postMatchDriverNotify = new Set(["matched", "arrived"]);
           if (
             postMatchDriverNotify.has(activeForDispatch.status) &&
@@ -835,13 +852,28 @@ async function handleEvent(event) {
             diff
           ) {
             const dname = getDriverDisplayName(activeForDispatch.driverId);
-            await pushText(
-              DRIVER_GROUP_ID,
-              `@${dname} 客人更新資訊：${diff}`
-            );
+            const afterTime = String(activeForDispatch.time ?? "").trim();
+            const timeChanged = orderBefore.time !== afterTime;
+            if (activeForDispatch.status === "matched" && timeChanged) {
+              const adminGid = (process.env.ADMIN_GROUP_ID || "").trim();
+              if (adminGid) {
+                await pushText(adminGid, `@${dname} 客人改時間為 ${afterTime}，請那個時間前到即可`);
+              }
+            }
+            const parts = diff.split("，");
+            const onlyTimeDiff = parts.length === 1 && /^時間→/.test(parts[0]);
+            const skipDriverFleet = activeForDispatch.status === "matched" && onlyTimeDiff;
+            if (!skipDriverFleet) {
+              await pushText(DRIVER_GROUP_ID, `@${dname} 客人更新資訊：${diff}`);
+            }
             const msg = "好的，已幫您通知司機。";
             await reply(replyToken, msg);
             appendConversationTurn(userId, "assistant", msg);
+            try {
+              await persistDispatchSnapshot(activeForDispatch, merged, finalBlock);
+            } catch (e) {
+              console.error("[persistDispatchSnapshot]", e?.message || e);
+            }
             return;
           }
 
@@ -1059,17 +1091,6 @@ function normalizeRideTimestampYearTo2026(ts) {
   return s;
 }
 
-/** 具體可派車時間：草稿時間欄或 AI ride_timestamp（客群派車閘門用）。 */
-function draftHasDispatchableSchedule(merged, ai) {
-  if (isConcreteCustomerPickupTime(merged?.time)) return true;
-  const raw = ai?.ride_timestamp || merged?.ride_timestamp;
-  if (!raw) return false;
-  const n = normalizeRideTimestampYearTo2026(String(raw));
-  if (!n) return false;
-  const ms = Date.parse(n);
-  return Number.isFinite(ms);
-}
-
 function clearAlarm(orderId) {
   const key = String(orderId ?? "");
   if (!key) return;
@@ -1227,6 +1248,7 @@ function createOrder(customerId, form) {
     const rideMs = Date.parse(normalizedRideTimestamp);
     if (Number.isFinite(rideMs)) orderDateYmd = taipeiYmdFromInstantMs(rideMs);
   }
+  const timeField = String(form.time ?? "").trim() || defaultCustomerPickupTimeNow();
   const newOrder = {
     orderId,
     status: "waiting",
@@ -1235,7 +1257,7 @@ function createOrder(customerId, form) {
     pickup: form.pickup,
     dropoff: form.dropoff,
     date: orderDateYmd,
-    time: form.time,
+    time: timeField,
     passengers: form.passengers || null,
     formText: form.rawText,
     estimatedRouteKm: form.estimated_route_km ?? null,
@@ -1283,6 +1305,25 @@ function taipeiYmdFromInstantMs(ms) {
     month: "2-digit",
     day: "2-digit"
   }).format(new Date(ms));
+}
+
+/** 客人未填時間時，預設為台北當下時刻（HH:mm）。 */
+function defaultCustomerPickupTimeNow() {
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Asia/Taipei",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false
+  }).formatToParts(new Date());
+  const h = parts.find((p) => p.type === "hour")?.value ?? "00";
+  const m = parts.find((p) => p.type === "minute")?.value ?? "00";
+  return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
+}
+
+function ensureCustomerPickupTimeDefaultNow(merged) {
+  const m = { ...(merged || {}) };
+  if (!String(m.time ?? "").trim()) m.time = defaultCustomerPickupTimeNow();
+  return m;
 }
 
 /** 僅在草稿無日期時補「今天」；客人已給日期（含明天）一律保留。 */
@@ -1616,6 +1657,26 @@ function applyMergedToWaitingOrder(order, merged, finalBlock) {
   order.estimatedRouteSource = merged.estimated_route_source ?? order.estimatedRouteSource;
 }
 
+/** 已媒合／已到點：同步訂單欄位但不重寫已鎖定派車卡 formText。 */
+function applyMergedToActiveDispatchOrder(order, merged) {
+  const safeMerged = forceDispatchDraftToday(merged);
+  const pickup = String(merged.pickup ?? "").trim();
+  if (pickup) {
+    order.pickup = pickup;
+    order.address = pickup;
+  }
+  const drop = String(merged.dropoff ?? "").trim();
+  if (drop) order.dropoff = drop;
+  order.time = String(merged.time ?? "").trim() || order.time;
+  order.date = normalizedDispatchCardDateYmd(safeMerged);
+  if (merged.passengers != null && String(merged.passengers).trim()) {
+    order.passengers = String(merged.passengers).trim();
+  }
+  order.estimatedRouteKm = merged.estimated_route_km ?? order.estimatedRouteKm;
+  order.estimatedRouteFare = merged.estimated_route_fare ?? order.estimatedRouteFare;
+  order.estimatedRouteSource = merged.estimated_route_source ?? order.estimatedRouteSource;
+}
+
 function summarizeOrderChangesForDriver(order, merged) {
   const before = {
     pickup: String(order.pickup || order.address || "").trim(),
@@ -1802,9 +1863,10 @@ ${surchargeLine}`;
 }
 
 function draftToRideForm(d, rawText) {
-  const safeDraft = forceDispatchDraftToday(d);
+  const withTime = ensureCustomerPickupTimeDefaultNow(d);
+  const safeDraft = forceDispatchDraftToday(withTime);
   const pickup = String(d.pickup ?? "").trim();
-  const time = String(d.time ?? "").trim();
+  const time = String(safeDraft.time ?? "").trim();
   const dropoff = String(d.dropoff ?? "").trim();
   const date = String(safeDraft.date ?? "").trim();
   const passengers = String(d.passengers ?? "").trim();
