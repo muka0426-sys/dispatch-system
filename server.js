@@ -1,6 +1,6 @@
 import "dotenv/config";
 import express from "express";
-import { pushText, pushMessage } from "./utils/line.js";
+import { pushText } from "./utils/line.js";
 import fs from "node:fs";
 import { appendFile, readFile, writeFile } from "node:fs/promises";
 import {
@@ -675,14 +675,17 @@ async function handleEvent(event) {
           const lineUid = orderDriverLineUserId(active);
           if (adminGid && lineUid) {
             try {
-              await pushMessage(
-                adminGid,
-                buildMatchedDriverTimeChangeAdminMessage(lineUid, afterTime)
-              );
+              const payload = buildMatchedDriverTimeChangeAdminMessage(lineUid, afterTime);
+              await fetch("https://api.line.me/v2/bot/message/push", {
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/json",
+                  Authorization: `Bearer ${process.env.LINE_CHANNEL_ACCESS_TOKEN}`
+                },
+                body: JSON.stringify({ to: adminGid, messages: [payload] })
+              });
             } catch (e) {
               console.error("[ADMIN_GROUP_ID mention push]", e?.message || e);
-              const dname = getDriverDisplayName(lineUid);
-              await pushText(adminGid, `@${dname} 客人改時間為 ${afterTime}，請那個時間前到即可`);
             }
           }
           const msg = "好的，已幫您通知司機。";
@@ -868,13 +871,17 @@ async function handleEvent(event) {
               const adminGid = (process.env.ADMIN_GROUP_ID || "").trim();
               if (adminGid && lineUid) {
                 try {
-                  await pushMessage(
-                    adminGid,
-                    buildMatchedDriverTimeChangeAdminMessage(lineUid, afterTime)
-                  );
+                  const payload = buildMatchedDriverTimeChangeAdminMessage(lineUid, afterTime);
+                  await fetch("https://api.line.me/v2/bot/message/push", {
+                    method: "POST",
+                    headers: {
+                      "Content-Type": "application/json",
+                      Authorization: `Bearer ${process.env.LINE_CHANNEL_ACCESS_TOKEN}`
+                    },
+                    body: JSON.stringify({ to: adminGid, messages: [payload] })
+                  });
                 } catch (e) {
                   console.error("[ADMIN_GROUP_ID mention push]", e?.message || e);
-                  await pushText(adminGid, `@${dname} 客人改時間為 ${afterTime}，請那個時間前到即可`);
                 }
               }
             }
@@ -2087,8 +2094,6 @@ async function processDriverFleetGroupMessage(_event, replyToken, userId, text, 
       }
     }, 5 * 60_000);
 
-    await reply(replyToken, "已通知客人");
-
     await pushText(
       matchedArrivedOrder.customerId,
 `📍 司機已抵達，請準備上車`
@@ -2129,8 +2134,6 @@ async function processDriverFleetGroupMessage(_event, replyToken, userId, text, 
     waitingOrder.driverEta = leader.kind === "minutes" ? String(leader.minutes ?? "") : "準";
     waitingOrder.rs.assignedAtMs = Date.now();
     waitingOrder.rs.assignedDriverUserId = leader.driverUserId;
-
-    await reply(replyToken, "已標記，車卡我這邊直接噴。");
 
     await notifyCustomerDriverMatched(
       waitingOrder.customerId,
@@ -2192,7 +2195,6 @@ async function processDriverFleetGroupMessage(_event, replyToken, userId, text, 
       return;
     }
 
-    await reply(replyToken, "收到，你目前不是領先喊單。");
     return;
   }
 
@@ -2203,8 +2205,6 @@ async function processDriverFleetGroupMessage(_event, replyToken, userId, text, 
     cardTargetOrder.driverId = userId;
     cardTargetOrder.driverUserId = userId;
     cardTargetOrder.driverEta = pending.time;
-
-    await reply(replyToken, "已派你出發 🚗");
 
     await notifyCustomerDriverMatched(cardTargetOrder.customerId, userId, pending.time);
 
@@ -2218,8 +2218,9 @@ async function processDriverFleetGroupMessage(_event, replyToken, userId, text, 
 }
 
 // ========================
-async function reply(token, text) {
+async function reply(token, payload) {
   try {
+    const messageObj = typeof payload === "string" ? { type: "text", text: payload } : payload;
     await fetch("https://api.line.me/v2/bot/message/reply", {
       method: "POST",
       headers: {
@@ -2228,7 +2229,7 @@ async function reply(token, text) {
       },
       body: JSON.stringify({
         replyToken: token,
-        messages: [{ type: "text", text }]
+        messages: [messageObj]
       })
     });
   } catch (err) {
