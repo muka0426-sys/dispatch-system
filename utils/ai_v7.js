@@ -1243,7 +1243,14 @@ export function canRsRapeTie({
 export function parseRsDispatcherMark(text) {
   const t = String(text ?? "");
   if (!t.includes("@")) return null;
-  // 簡化：只要有 @ 就視為派單員已標記（細節由 server.js 對應到哪位司機）
+
+  // 排除司機回覆機器人時自動帶入的 @標記 (例如：@演示機one 萬華10)
+  // 如果這句話可以被成功解析為司機喊單（有分鐘數或準），它就絕對不是派單員標記
+  const bidAttempt = parseRsDriverBid(text);
+  if (bidAttempt.kind === "ready" || bidAttempt.kind === "minutes") {
+    return null;
+  }
+
   return { kind: "dispatcher_marked" };
 }
 
