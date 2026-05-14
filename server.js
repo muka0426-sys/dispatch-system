@@ -2186,7 +2186,9 @@ async function processDriverFleetGroupMessage(_event, replyToken, userId, text, 
     if (leader && leader.driverUserId === userId) {
       const eta = leader.kind === "minutes" ? String(leader.minutes ?? "") : "準";
       pendingDriver[waitingOrder.orderId] = { userId, time: eta };
-      await reply(replyToken, `目前領先：${eta}${eta === "準" ? "" : "分"}，等派單員@標記我就噴車卡。`);
+      // 老闆指示：直接噴司機個人車卡，不要回覆領先幾分的廢話
+      const cardText = getDriverCardText(userId);
+      await reply(replyToken, cardText);
       return;
     }
 
