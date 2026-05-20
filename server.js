@@ -2220,7 +2220,11 @@ async function processDriverFleetGroupMessage(_event, replyToken, userId, text, 
 // ========================
 async function reply(token, payload) {
   try {
-    const messageObj = typeof payload === "string" ? { type: "text", text: payload } : payload;
+    const messageObj =
+      typeof payload === "string"
+        ? { type: "text", text: payload }
+        : payload;
+
     await fetch("https://api.line.me/v2/bot/message/reply", {
       method: "POST",
       headers: {
