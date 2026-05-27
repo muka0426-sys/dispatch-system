@@ -579,15 +579,89 @@ async function handleEvent(event) {
       const state = getUserState(userId);
       const hasCarKeyword = text.includes("叫車") || text.includes("車");
 
-      if (text.includes("取消")) {
-        clearAlarmByCustomer(userId);
-        deleteOrderByCustomer(userId);
-        clearDispatchDraft(userId);
-        clearPendingDispatchConfirmation(userId);
-        setUserState(userId, "idle", { conversationLog: [] });
-        await reply(replyToken, "已取消訂單");
-        return;
+      // ===== 最小安全版：客人取消攔截器 V3.6（必須在 appendConversationTurn 前）=====
+      {
+        // 只建立取消判斷用影子字串，不污染原始 text
+        const cancelProbe = String(text ?? "")
+          .trim()
+          .toLowerCase()
+          .replace(/[\s\r\n\t　]+/g, "")
+          .replace(/[，。！？、,.!?；;：:「」『』（）()【】\[\]《》<>／\/\\\-＿_~～…·•]/g, "");
+
+        const isCancelNegatedOrQuestion =
+          cancelProbe.includes("不要取消") ||
+          cancelProbe.includes("不要幫我取消") ||
+          cancelProbe.includes("我不是要取消") ||
+          cancelProbe.includes("取消了嗎") ||
+          cancelProbe.includes("可以取消嗎") ||
+          cancelProbe.includes("可不可以取消") ||
+          cancelProbe.includes("能取消嗎") ||
+          cancelProbe.includes("別幫我取消") ||
+          cancelProbe.includes("別取消") ||
+          cancelProbe.includes("先別取消") ||
+          cancelProbe.includes("是不是取消了") ||
+          cancelProbe.includes("剛剛是不是取消了") ||
+          cancelProbe.includes("取消費") ||
+          cancelProbe.includes("取消規則") ||
+          cancelProbe.includes("取消會怎樣") ||
+          cancelProbe.includes("取消要錢嗎") ||
+          cancelProbe.includes("不用幫我取消") ||
+          cancelProbe.includes("不用取消") ||
+          cancelProbe.includes("如果取消") ||
+          cancelProbe.includes("怎麼取消");
+
+        const isExplicitCancel =
+          cancelProbe.includes("幫我取消") ||
+          cancelProbe.includes("不叫了") ||
+          cancelProbe.includes("不用了") ||
+          cancelProbe.includes("那算了") ||
+          cancelProbe.includes("先不用") ||
+          cancelProbe.includes("不坐了") ||
+          cancelProbe === "取消" ||
+          cancelProbe.endsWith("取消");
+
+        if (isExplicitCancel && !isCancelNegatedOrQuestion) {
+          const active = getActiveOrder(userId);
+          const status = String(active?.status ?? "").toLowerCase();
+
+          // 沒有進行中訂單，或已是終態：阻斷取消進 AI，清理客人端暫存
+          if (!active || status === "done" || status === "canceled") {
+            clearDispatchDraft(userId);
+            clearPendingDispatchConfirmation(userId);
+            setUserState(userId, "idle", { conversationLog: [] });
+            await reply(replyToken, "目前沒有進行中的叫車訂單");
+            return;
+          }
+
+          // waiting：尚未媒合司機，可直接取消並清掉實單
+          if (status === "waiting") {
+            clearAlarmByCustomer(userId);
+            deleteOrderByCustomer(userId);
+            clearDispatchDraft(userId);
+            clearPendingDispatchConfirmation(userId);
+            setUserState(userId, "idle", { conversationLog: [] });
+            await reply(replyToken, "已為您取消叫車");
+            return;
+          }
+
+          // 已媒合 / 已抵達 / 已上車：第一階段只攔截，不刪單、不改狀態
+          if (status === "matched" || status === "arrived" || status === "onboard") {
+            await reply(
+              replyToken,
+              "已收到您的取消請求，因司機可能已接單或已抵達，這邊需要由管理群或司機確認後處理，謝謝。"
+            );
+            return;
+          }
+
+          // 未知狀態：保守處理，避免取消進 AI
+          clearDispatchDraft(userId);
+          clearPendingDispatchConfirmation(userId);
+          setUserState(userId, "idle", { conversationLog: [] });
+          await reply(replyToken, "目前沒有進行中的叫車訂單");
+          return;
+        }
       }
+      // ===== end 取消攔截器 V3.6 =====
 
       appendConversationTurn(userId, "user", text);
 
