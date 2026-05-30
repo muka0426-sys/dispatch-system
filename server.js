@@ -628,6 +628,7 @@ async function handleEvent(event) {
           if (!active || status === "done" || status === "canceled") {
             clearDispatchDraft(userId);
             clearPendingDispatchConfirmation(userId);
+            clearPendingSpecialRequest(userId);
             setUserState(userId, "idle", { conversationLog: [] });
             await reply(replyToken, "目前沒有進行中的叫車訂單");
             return;
@@ -639,6 +640,7 @@ async function handleEvent(event) {
             deleteOrderByCustomer(userId);
             clearDispatchDraft(userId);
             clearPendingDispatchConfirmation(userId);
+            clearPendingSpecialRequest(userId);
             setUserState(userId, "idle", { conversationLog: [] });
             await reply(replyToken, "已為您取消叫車");
             return;
@@ -646,6 +648,7 @@ async function handleEvent(event) {
 
           // 已媒合 / 已抵達 / 已上車：第一階段只攔截，不刪單、不改狀態
           if (status === "matched" || status === "arrived" || status === "onboard") {
+            clearPendingSpecialRequest(userId);
             await reply(
               replyToken,
               "已收到您的取消請求，因司機可能已接單或已抵達，這邊需要由管理群或司機確認後處理，謝謝。"
@@ -656,6 +659,7 @@ async function handleEvent(event) {
           // 未知狀態：保守處理，避免取消進 AI
           clearDispatchDraft(userId);
           clearPendingDispatchConfirmation(userId);
+          clearPendingSpecialRequest(userId);
           setUserState(userId, "idle", { conversationLog: [] });
           await reply(replyToken, "目前沒有進行中的叫車訂單");
           return;
@@ -672,6 +676,31 @@ async function handleEvent(event) {
         await reply(replyToken, msg);
         appendConversationTurn(userId, "assistant", msg);
         return;
+      }
+
+      let confirmedSpecialRequestThisTurn = false;
+      const pendingSpecial = getPendingSpecialRequest(userId);
+      if (pendingSpecial) {
+        if (isSpecialRequestPendingAbandonText(text)) {
+          clearPendingSpecialRequest(userId);
+          clearDispatchDraft(userId);
+          clearPendingDispatchConfirmation(userId);
+          setUserState(userId, "idle", { conversationLog: [] });
+          const abandonMsg = "好的，先不繼續派車；如果還需要叫車，再傳上車地點給我。";
+          await reply(replyToken, abandonMsg);
+          appendConversationTurn(userId, "assistant", abandonMsg);
+          return;
+        }
+        if (isSpecialRequestPendingConfirmText(text)) {
+          confirmedSpecialRequestThisTurn = true;
+          clearPendingSpecialRequest(userId);
+        } else {
+          const specialHoldMsg =
+            "此需求需要先確認加價或人工確認，請回覆 OK / 可以 後再繼續。";
+          await reply(replyToken, specialHoldMsg);
+          appendConversationTurn(userId, "assistant", specialHoldMsg);
+          return;
+        }
       }
 
       // v0.3.2：修改時間意圖 → 清除舊 alarm，更新 rideTimestamp 後重設 alarm
@@ -836,8 +865,20 @@ async function handleEvent(event) {
 
       const pickupBlockReason = pickupEmptyBlockReason(merged.pickup);
       const hasPickupCandidate = !pickupBlockReason && Boolean(merged.pickup?.trim());
+
+      const special = detectSpecialServiceRequest(text, merged);
+      if (special.hit && !confirmedSpecialRequestThisTurn) {
+        setPendingSpecialRequest(userId, { merged, reasons: special.reasons, atMs: Date.now() });
+        setDispatchDraft(userId, merged);
+        const specialLockMsg = buildSpecialRequestLockMessage(special.reasons);
+        await reply(replyToken, specialLockMsg);
+        appendConversationTurn(userId, "assistant", specialLockMsg);
+        return;
+      }
+
       // v0.7.11：AI 只萃取上車文字；盲派前的最終可派判定必須由 Google Maps API 完成。
-      const driverReady = Boolean(ai?.ride_related) && hasPickupCandidate;
+      const driverReady =
+        hasPickupCandidate && (Boolean(ai?.ride_related) || confirmedSpecialRequestThisTurn);
 
       if (driverReady) {
         const activeForDispatch = getActiveOrder(userId);
@@ -1510,6 +1551,85 @@ function getPendingDispatchConfirmation(userId) {
 function clearPendingDispatchConfirmation(userId) {
   if (!users[userId]) return;
   delete users[userId].pendingDispatchConfirmation;
+}
+
+function getPendingSpecialRequest(userId) {
+  const p = users[userId]?.pending_special_request;
+  if (!p || typeof p !== "object") return null;
+  return p;
+}
+
+function setPendingSpecialRequest(userId, payload) {
+  setUserState(userId, getUserState(userId), { pending_special_request: payload });
+}
+
+function clearPendingSpecialRequest(userId) {
+  if (!users[userId]) return;
+  delete users[userId].pending_special_request;
+}
+
+function detectSpecialServiceRequest(text, merged) {
+  const reasons = [];
+  const probe = [
+    String(text ?? ""),
+    String(merged?.vehicle_request_type ?? ""),
+    String(merged?.pickup ?? ""),
+    String(merged?.dropoff ?? ""),
+    String(merged?.passengers ?? "")
+  ].join(" ");
+
+  const keywordRe = /代買|跑腿|運送|搬家|寵物|大車|休旅|SUV|雙B|行李多|指定車/i;
+  const km = probe.match(keywordRe);
+  if (km) reasons.push(`keyword:${km[0]}`);
+
+  const vtype = String(merged?.vehicle_request_type ?? "").trim();
+  if (vtype) reasons.push(`vehicle_request_type:${vtype}`);
+
+  const surcharge = Number(merged?.fare_surcharge ?? 0);
+  if (Number.isFinite(surcharge) && surcharge > 0) reasons.push(`fare_surcharge:${surcharge}`);
+
+  const hit = Boolean(km) || Boolean(vtype);
+  return { hit, reasons };
+}
+
+function normalizeSpecialPendingText(text) {
+  return String(text ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/[\s\r\n\t　]+/g, "")
+    .replace(/[，。！？、,.!?；;：:「」『』（）()【】\[\]《》<>／\/\\\-＿_~～…·•]/g, "");
+}
+
+function isSpecialRequestPendingConfirmText(text) {
+  if (isDispatchConfirmationText(text)) return true;
+  const p = normalizeSpecialPendingText(text);
+  return p === "要" || p === "我要";
+}
+
+function isSpecialRequestPendingAbandonText(text) {
+  const p = normalizeSpecialPendingText(text);
+  return p === "算了" || p === "先算了";
+}
+
+function buildSpecialRequestLockMessage(reasons) {
+  const labels = [];
+  for (const r of reasons || []) {
+    if (r.startsWith("keyword:")) {
+      labels.push(r.slice("keyword:".length));
+    } else if (r.startsWith("vehicle_request_type:")) {
+      const v = r.slice("vehicle_request_type:".length);
+      if (v === "suv") labels.push("休旅");
+      else if (v === "double_b") labels.push("雙B");
+      else if (v === "suv_double_b") labels.push("休旅/雙B");
+      else if (v === "specified") labels.push("指定車型");
+      else labels.push(v);
+    }
+  }
+  const uniq = [...new Set(labels.map((s) => String(s).trim()).filter(Boolean))];
+  if (uniq.length > 0) {
+    return `收到，您這單有${uniq.join("/")}需求，可能需要加價或人工確認。若您同意，請回覆「好」或「OK」，我再繼續幫您找車。`;
+  }
+  return "收到，這個需求可能需要加價或人工確認。若您同意，請回覆「好」或「OK」，我再繼續幫您找車。";
 }
 
 function isDispatchConfirmationText(text) {
