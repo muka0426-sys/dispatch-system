@@ -629,6 +629,7 @@ async function handleEvent(event) {
             clearDispatchDraft(userId);
             clearPendingDispatchConfirmation(userId);
             clearPendingSpecialRequest(userId);
+            clearPendingQuoteConfirmation(userId);
             setUserState(userId, "idle", { conversationLog: [] });
             await reply(replyToken, "目前沒有進行中的叫車訂單");
             return;
@@ -641,6 +642,7 @@ async function handleEvent(event) {
             clearDispatchDraft(userId);
             clearPendingDispatchConfirmation(userId);
             clearPendingSpecialRequest(userId);
+            clearPendingQuoteConfirmation(userId);
             setUserState(userId, "idle", { conversationLog: [] });
             await reply(replyToken, "已為您取消叫車");
             return;
@@ -649,6 +651,7 @@ async function handleEvent(event) {
           // 已媒合 / 已抵達 / 已上車：第一階段只攔截，不刪單、不改狀態
           if (status === "matched" || status === "arrived" || status === "onboard") {
             clearPendingSpecialRequest(userId);
+            clearPendingQuoteConfirmation(userId);
             await reply(
               replyToken,
               "已收到您的取消請求，因司機可能已接單或已抵達，這邊需要由管理群或司機確認後處理，謝謝。"
@@ -660,6 +663,7 @@ async function handleEvent(event) {
           clearDispatchDraft(userId);
           clearPendingDispatchConfirmation(userId);
           clearPendingSpecialRequest(userId);
+          clearPendingQuoteConfirmation(userId);
           setUserState(userId, "idle", { conversationLog: [] });
           await reply(replyToken, "目前沒有進行中的叫車訂單");
           return;
@@ -676,6 +680,31 @@ async function handleEvent(event) {
         await reply(replyToken, msg);
         appendConversationTurn(userId, "assistant", msg);
         return;
+      }
+
+      let confirmedQuoteThisTurn = false;
+      const pendingQuote = getPendingQuoteConfirmation(userId);
+      if (pendingQuote) {
+        if (isQuoteAbandonText(text)) {
+          clearPendingQuoteConfirmation(userId);
+          clearDispatchDraft(userId);
+          clearPendingDispatchConfirmation(userId);
+          setUserState(userId, "idle", { conversationLog: [] });
+          const quoteAbandonMsg = "好的，先不幫您叫車；如果還需要用車，再傳上車地點給我。";
+          await reply(replyToken, quoteAbandonMsg);
+          appendConversationTurn(userId, "assistant", quoteAbandonMsg);
+          return;
+        }
+        if (isQuoteBookingConfirmText(text)) {
+          confirmedQuoteThisTurn = true;
+          clearPendingQuoteConfirmation(userId);
+        } else {
+          const quoteConfirmMsg =
+            "好的，請問您現在要我幫您叫車嗎？如果確定要叫車，請回覆「要叫車」或「幫我叫」。";
+          await reply(replyToken, quoteConfirmMsg);
+          appendConversationTurn(userId, "assistant", quoteConfirmMsg);
+          return;
+        }
       }
 
       let confirmedSpecialRequestThisTurn = false;
@@ -830,6 +859,22 @@ async function handleEvent(event) {
         setDispatchDraft(userId, merged);
       }
 
+      const quote = detectPureQuoteIntent(text, merged);
+      if (quote.hit && !confirmedQuoteThisTurn) {
+        setPendingQuoteConfirmation(userId, {
+          merged,
+          estimated_fare_text: String(merged?.estimated_fare_text ?? "").trim(),
+          triggerText: text,
+          reasons: quote.reasons,
+          atMs: Date.now()
+        });
+        setDispatchDraft(userId, merged);
+        const quoteMsg = buildQuoteConfirmationMessage(merged);
+        await reply(replyToken, quoteMsg);
+        appendConversationTurn(userId, "assistant", quoteMsg);
+        return;
+      }
+
       // v0.3.0：未建檔路線 → 轉管理員報價（暫停對客回覆）
       // 惡搞／未核實上車點：嚴禁對管理群發求報價（避免蟑螂區等仍噴白目卡片）。
       if (
@@ -878,7 +923,8 @@ async function handleEvent(event) {
 
       // v0.7.11：AI 只萃取上車文字；盲派前的最終可派判定必須由 Google Maps API 完成。
       const driverReady =
-        hasPickupCandidate && (Boolean(ai?.ride_related) || confirmedSpecialRequestThisTurn);
+        hasPickupCandidate &&
+        (Boolean(ai?.ride_related) || confirmedSpecialRequestThisTurn || confirmedQuoteThisTurn);
 
       if (driverReady) {
         const activeForDispatch = getActiveOrder(userId);
@@ -1568,6 +1614,21 @@ function clearPendingSpecialRequest(userId) {
   delete users[userId].pending_special_request;
 }
 
+function getPendingQuoteConfirmation(userId) {
+  const p = users[userId]?.pending_quote_confirmation;
+  if (!p || typeof p !== "object") return null;
+  return p;
+}
+
+function setPendingQuoteConfirmation(userId, payload) {
+  setUserState(userId, getUserState(userId), { pending_quote_confirmation: payload });
+}
+
+function clearPendingQuoteConfirmation(userId) {
+  if (!users[userId]) return;
+  delete users[userId].pending_quote_confirmation;
+}
+
 function detectSpecialServiceRequest(text, merged) {
   const reasons = [];
   const probe = [
@@ -1590,6 +1651,58 @@ function detectSpecialServiceRequest(text, merged) {
 
   const hit = Boolean(km) || Boolean(vtype);
   return { hit, reasons };
+}
+
+function normalizeQuotePendingText(text) {
+  return String(text ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/[\s\r\n\t　]+/g, "")
+    .replace(/[，。！？、,.!?；;：:「」『』（）()【】\[\]《》<>／\/\\\-＿_~～…·•]/g, "");
+}
+
+function detectPureQuoteIntent(text, _merged) {
+  const reasons = [];
+  const t = String(text ?? "").trim();
+  if (!t) return { hit: false, reasons };
+
+  if (/多少錢|幾錢|車資|費用|報價|怎麼算|多少算/.test(t)) {
+    reasons.push("keyword:pricing_question");
+  }
+  if (/多少|大概多少|約多少/.test(t)) reasons.push("keyword:多少");
+  if (/有定額嗎|定額嗎|定額/.test(t)) reasons.push("keyword:定額");
+  if (/機場.{0,8}多少|機場接送/.test(t)) reasons.push("keyword:airport_quote");
+  if (/包車多少|包車/.test(t) && /多少|費用|車資|報價|怎麼算/.test(t)) {
+    reasons.push("keyword:包車");
+  }
+
+  return { hit: reasons.length > 0, reasons: [...new Set(reasons)] };
+}
+
+function isQuoteBookingConfirmText(text) {
+  const p = normalizeQuotePendingText(text);
+  if (!p) return false;
+  return /要叫車|我要車|幫我叫車?|現在叫車?|叫車|派車|麻煩安排|安排/.test(p);
+}
+
+function isQuoteAbandonText(text) {
+  const p = normalizeQuotePendingText(text);
+  return p === "算了" || p === "先算了";
+}
+
+function buildQuoteConfirmationMessage(merged) {
+  const pickup = String(merged?.pickup ?? "").trim();
+  const dropoff = String(merged?.dropoff ?? "").trim();
+  const fare = String(merged?.estimated_fare_text ?? "").trim();
+  const route = pickup && dropoff ? `${pickup} → ${dropoff}` : "";
+
+  if (route && fare) {
+    return `收到，為您估算【${route}】車資約為 ${fare}。此時尚未幫您叫車；如果確定要用車，請回覆「要叫車」或「幫我叫」。`;
+  }
+  if (fare) {
+    return `收到，先幫您估算這趟車資約為 ${fare}。此時尚未幫您叫車；如果確定要用車，請回覆「要叫車」或「幫我叫」。`;
+  }
+  return "收到，先幫您估算這趟車資。此時尚未幫您叫車；如果確定要用車，請回覆「要叫車」或「幫我叫」。";
 }
 
 function normalizeSpecialPendingText(text) {
