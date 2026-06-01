@@ -56,6 +56,17 @@
 - purpose: 問價回覆優先顯示 `ai.price` 或 Google Maps 最短路線估價，避免只顯示公式。
 - note: server.js no longer modified after commit `076a2f2`.
 
+### Fare formula ceil-km fix
+
+- commit: `8221c73`
+- status: **completed locally, not pushed yet**
+- rule: `fare = max(130, 50 + 20 * Math.ceil(km))`
+- examples:
+  - 3.4 km → 130
+  - 5.2 km → 170
+  - 6.0 km → 170
+  - 6.1 km → 190
+
 ## 4. Current deployment notes
 
 - `origin/main` 已曾指向 `8e16fdb`。
@@ -64,6 +75,8 @@
 - origin/main 尚未包含 `076a2f2`。
 - 本地 main ahead of origin/main by 1 commit。
 - Railway 是否已部署 `076a2f2`：not verified。
+- origin/main 尚未包含 `8221c73`。
+- Railway 尚未部署 `8221c73`。
 - 不要假設部署成功；每次測試前確認 Railway running SHA。
 
 ## 5. Latest important test observations
@@ -71,6 +84,8 @@
 - 問價誤派車大洞已由 fare_quote_gate V1 修正方向處理（問價不再直接派車）。
 - 線上測試「你幫我算 林森北路409號到三重三和夜市多少錢？」已不再回「已為您派車」。
 - V1.1 已在本地修正報價顯示來源，但尚未 push / 尚未線上驗證。
+- 但最新公式修正 `8221c73` 尚未 push / 尚未線上驗證。
+- 待驗證重點：問價「你幫我算 林森北路409號到三重三和夜市多少錢？」應顯示 130，不應顯示 118。
 - 需要驗證的句子：
   1. 你幫我算 林森北路409號到三重三和夜市多少錢？
   2. 林森北路409號到三重三和夜市多少錢？
@@ -105,7 +120,8 @@
 ## 8. Current next step
 
 - 先驗收 `PROJECT_STATE.md`。
-- 再決定是否 commit `PROJECT_STATE.md`。
-- 再決定是否 push main 觸發部署測試 `076a2f2`。
-- 不開新功能。
+- 再 commit `PROJECT_STATE.md`。
+- 再 push main。
+- 再確認 Railway running SHA。
+- 最後只測一題問價。
 
