@@ -869,7 +869,9 @@ async function handleEvent(event) {
           atMs: Date.now()
         });
         setDispatchDraft(userId, merged);
-        const quoteMsg = buildQuoteConfirmationMessage(merged);
+        const displayFareText = await buildQuoteFareTextForDisplay(ai, merged);
+        const displayMerged = { ...merged, estimated_fare_text: displayFareText };
+        const quoteMsg = buildQuoteConfirmationMessage(displayMerged);
         await reply(replyToken, quoteMsg);
         appendConversationTurn(userId, "assistant", quoteMsg);
         return;
@@ -1690,17 +1692,64 @@ function isQuoteAbandonText(text) {
   return p === "算了" || p === "先算了";
 }
 
+function isQuoteDisplayFlatOrExplicitFareText(fareText) {
+  const s = String(fareText ?? "").trim();
+  if (!s) return false;
+  if (/機場定額|內建路線定額/.test(s)) return true;
+  if (/定額\s*\$?\d+/.test(s)) return true;
+  if (/最短[\d.]+km/.test(s) && /\$\d+/.test(s)) return true;
+  if (/起步\$50＋\$20\/公里/.test(s)) return false;
+  if (/\$\d+/.test(s)) return true;
+  return false;
+}
+
+function extractQuoteFareSuffixNotes(fareText) {
+  const s = String(fareText ?? "").trim();
+  const parts = [];
+  const wait = s.match(/；等候[^；]*/);
+  if (wait) parts.push(wait[0].slice(1));
+  const sur = s.match(/；加價\+\$\d+/);
+  if (sur) parts.push(sur[0].slice(1));
+  return parts.length ? `；${parts.join("；")}` : "";
+}
+
+async function buildQuoteFareTextForDisplay(ai, merged) {
+  const original = String(merged?.estimated_fare_text ?? "").trim();
+  if (isQuoteDisplayFlatOrExplicitFareText(original)) {
+    return original;
+  }
+
+  const suffix = extractQuoteFareSuffixNotes(original);
+  const price = ai?.price == null ? null : Number(ai.price);
+  if (Number.isFinite(price) && price > 0) {
+    return `約 $${Math.round(price)}${suffix}`;
+  }
+
+  const pickup = String(merged?.pickup ?? "").trim();
+  const dropoff = String(merged?.dropoff ?? "").trim();
+  if (pickup && dropoff) {
+    const est = await getGoogleShortestRouteEstimate({ origin: pickup, destination: dropoff });
+    if (est?.km) {
+      const fare = Math.round(50 + 20 * Number(est.km));
+      return `最短${est.km}km，預估約 $${fare}${suffix}`;
+    }
+  }
+
+  return original;
+}
+
 function buildQuoteConfirmationMessage(merged) {
   const pickup = String(merged?.pickup ?? "").trim();
   const dropoff = String(merged?.dropoff ?? "").trim();
   const fare = String(merged?.estimated_fare_text ?? "").trim();
   const route = pickup && dropoff ? `${pickup} → ${dropoff}` : "";
+  const fareStartsWithAboutMoney = /^約\s*\$/.test(fare) || /^約\$\d+/.test(fare);
 
   if (route && fare) {
-    return `收到，為您估算【${route}】車資約為 ${fare}。此時尚未幫您叫車；如果確定要用車，請回覆「要叫車」或「幫我叫」。`;
+    return `收到，為您估算【${route}】車資${fareStartsWithAboutMoney ? "" : "約為 "}${fare}。此時尚未幫您叫車；如果確定要用車，請回覆「要叫車」或「幫我叫」。`;
   }
   if (fare) {
-    return `收到，先幫您估算這趟車資約為 ${fare}。此時尚未幫您叫車；如果確定要用車，請回覆「要叫車」或「幫我叫」。`;
+    return `收到，先幫您估算這趟車資${fareStartsWithAboutMoney ? "" : "約為 "}${fare}。此時尚未幫您叫車；如果確定要用車，請回覆「要叫車」或「幫我叫」。`;
   }
   return "收到，先幫您估算這趟車資。此時尚未幫您叫車；如果確定要用車，請回覆「要叫車」或「幫我叫」。";
 }
