@@ -98,13 +98,16 @@
 
 只寫可確認事實，不要腦補：
 
+- **訓練資料主狀態檔：** `TRAINING_DATA_STATUS.md`
+- **最新可用資料入口：** `hermes_candidate_usable_data/`
+- **Hermes manifest：** `hermes_training_pack_20260523_040314/hermes_training_manifest.csv`
+- **品質 manifest：** `data_quality_manifest.csv`
+- **詳細訓練資料狀態以 `TRAINING_DATA_STATUS.md` 為準**（含可用 / 禁止 / 個資規則與統計）
 - `LOBSTER_ARCHIVE_MANIFEST_20260523.txt` exists.
 - `RESTORE_LOBSTER_ARCHIVE_20260523.ps1` exists.
-- `hermes_training_pack_20260523_040314/hermes_training_manifest.csv` exists.
 - `.openclaw/workspace-state.json` exists.
 - 龍蝦 / OpenClaw 曾用來抓 LINE 客戶對話紀錄；這些資料是未來訓練 / 規則萃取的重要來源。
-- 需要注意亂碼資料不可直接作為訓練資料。
-- 目前可用/不可用比例：**needs verification**（可從 `hermes_training_manifest.csv` 欄位如 `LooksGarbled`, `HasFinal`, `ChineseChars` 做摘要）。
+- 需要注意亂碼資料不可直接作為訓練資料（manifest 約 443 筆 `LooksGarbled`；見 `TRAINING_DATA_STATUS.md`）。
 
 ## 7. Important existing reference files
 
