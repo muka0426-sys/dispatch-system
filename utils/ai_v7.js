@@ -986,8 +986,10 @@ export async function parseOrderFromText(messageText, options = {}) {
                   destination: draft.dropoff || messageText
                 });
                 if (est?.km) {
-                  const calc = Math.round(50 + 20 * Number(est.km));
-                  draft.estimated_fare_text = `最短${est.km}km 估$${calc}`;
+                  const calc = rsFareExpectedBy52(est.km);
+                  if (Number.isFinite(calc)) {
+                    draft.estimated_fare_text = `最短${est.km}km 估$${calc}`;
+                  }
                 } else {
                   const flatFallback = estimateAirportFlatFare(draft.pickup);
                   draft.estimated_fare_text = `機場定額 $${flatFallback}`;
@@ -1037,7 +1039,8 @@ export async function parseOrderFromText(messageText, options = {}) {
               });
               if (est?.km) {
                 needs_admin_pricing = false;
-                price = Math.round(50 + 20 * Number(est.km));
+                const calc = rsFareExpectedBy52(est.km);
+                price = Number.isFinite(calc) ? calc : null;
               } else {
                 needs_admin_pricing = true;
                 price = null;
@@ -1285,9 +1288,10 @@ export function parseRsStateSignal(text) {
 
 export function rsFareExpectedBy52(km) {
   const k = Number(km);
-  if (!Number.isFinite(k) || k < 0) return null;
-  const raw = 50 + 20 * k;
-  return Math.max(130, Math.round(raw));
+  if (!Number.isFinite(k) || k <= 0) return null;
+  const billedKm = Math.ceil(k);
+  const raw = 50 + 20 * billedKm;
+  return Math.max(130, raw);
 }
 
 export function rsFareBy52FromMeters(distanceMeters) {

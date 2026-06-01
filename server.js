@@ -1730,7 +1730,8 @@ async function buildQuoteFareTextForDisplay(ai, merged) {
   if (pickup && dropoff) {
     const est = await getGoogleShortestRouteEstimate({ origin: pickup, destination: dropoff });
     if (est?.km) {
-      const fare = Math.round(50 + 20 * Number(est.km));
+      const billedKm = Math.ceil(Number(est.km));
+      const fare = Math.max(130, 50 + 20 * billedKm);
       return `最短${est.km}km，預估約 $${fare}${suffix}`;
     }
   }
