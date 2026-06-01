@@ -119,6 +119,15 @@ Hermes README 另註：`skipped_other`、`skipped_group` 等類別存在；詳�
 7. 不要讓正式 LINE 派單主系統直接讀取訓練資料目錄。
 8. 訓練資料整理、Hermes 教材維護與正式營運部署分開進行。
 
+## Gemini / Hermes analysis outputs
+
+- repo 內目前**未找到** Gemini 已整理完成的派單規則摘要 / 訓練摘要 / 對話分類 prose 報告（獨立檔案）。
+- `hermes_training_pack_20260523_040314/README_HERMES_READ_FIRST.txt` 是**分析指令**（規定 Hermes / Gemini 如何讀取教材），**不是**已完成分析結果。
+- `hermes_training_manifest.csv` / `data_quality_manifest.csv` 是 **manifest / 分類索引**，不是 Gemini prose summary。
+- `rules/dispatch_rules_v1.js` 是**手寫規則**定義，**不可**誤標為龍蝦 / Gemini 整理成果。
+- 若未來找到外部 Gemini 對話摘要（例如網頁對話、本機未入庫檔），必須**先去識別化**，再決定是否入庫。
+- 在 repo 內找到此類輸出之前，**不准**把「已訓練完成」或「已完成規則萃取」當作事實。
+
 ## 7. Current next step
 
 - 第一階段：只建立文件型訓練資料狀態（本檔 + `PROJECT_STATE.md` 指向）。

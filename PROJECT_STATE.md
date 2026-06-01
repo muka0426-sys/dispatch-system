@@ -103,6 +103,7 @@
 - **Hermes manifest：** `hermes_training_pack_20260523_040314/hermes_training_manifest.csv`
 - **品質 manifest：** `data_quality_manifest.csv`
 - **詳細訓練資料狀態以 `TRAINING_DATA_STATUS.md` 為準**（含可用 / 禁止 / 個資規則與統計）
+- **Gemini / Hermes 規則萃取輸出：** repo 內尚未找到；詳見 `TRAINING_DATA_STATUS.md`（Gemini / Hermes analysis outputs）
 - `LOBSTER_ARCHIVE_MANIFEST_20260523.txt` exists.
 - `RESTORE_LOBSTER_ARCHIVE_20260523.ps1` exists.
 - `.openclaw/workspace-state.json` exists.
