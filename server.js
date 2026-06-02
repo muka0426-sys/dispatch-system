@@ -732,6 +732,15 @@ async function handleEvent(event) {
         }
       }
 
+      // ===== Status inquiry gate P0-A-002：狀態追問不是新單 =====
+      if (detectStatusInquiry(text)) {
+        const statusMsg = buildStatusInquiryReply(userId);
+        await reply(replyToken, statusMsg);
+        appendConversationTurn(userId, "assistant", statusMsg);
+        return;
+      }
+      // ===== end Status inquiry gate =====
+
       // v0.3.2：修改時間意圖 → 清除舊 alarm，更新 rideTimestamp 後重設 alarm
       // v0.7.20：客人未給新時間時不追問，草稿時間預設為現在；已媒合改時間改推司機主群。
       const modifyTimeIntent =
@@ -1629,6 +1638,73 @@ function setPendingQuoteConfirmation(userId, payload) {
 function clearPendingQuoteConfirmation(userId) {
   if (!users[userId]) return;
   delete users[userId].pending_quote_confirmation;
+}
+
+function normalizeStatusInquiryProbe(text) {
+  return String(text ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/[\s\r\n\t　]+/g, "")
+    .replace(/[，。！？、,.!?；;：:「」『』（）()【】\[\]《》<>／\/\\\-＿_~～…·•]/g, "");
+}
+
+/** P0-A-002：純狀態追問（有嗎 / 到了嗎等），非新叫車 intent。 */
+function detectStatusInquiry(text) {
+  const raw = String(text ?? "").trim();
+  if (!raw) return false;
+
+  if (/取消/.test(raw)) return false;
+  if (/多少錢|幾錢|車資|報價|怎麼算|多少算/.test(raw)) return false;
+  if (/上車|下車/.test(raw)) return false;
+  if (/寵物|大車|代買|跑腿|運送|搬家|休旅|SUV|行李多|指定車/.test(raw)) return false;
+  if (/(路|街|巷|弄|號|區|市|縣|鄉|鎮|台|臺)/.test(raw) && /\d/.test(raw)) return false;
+  if (/\d+號|\d+巷|\d+弄/.test(raw)) return false;
+
+  const p = normalizeStatusInquiryProbe(raw);
+  if (!p) return false;
+
+  return (
+    p === "有嗎" ||
+    p === "有車嗎" ||
+    p === "車有嗎" ||
+    p === "到了嗎" ||
+    p === "司機到了嗎" ||
+    p === "車到了嗎" ||
+    p === "還在找嗎" ||
+    p === "找到了嗎"
+  );
+}
+
+function hasMeaningfulDispatchDraft(userId) {
+  const d = getDispatchDraft(userId);
+  if (String(d.pickup ?? "").trim()) return true;
+  if (String(d.dropoff ?? "").trim()) return true;
+  return false;
+}
+
+function buildStatusInquiryReply(userId) {
+  const active = getActiveOrder(userId);
+  if (!active) {
+    if (hasMeaningfulDispatchDraft(userId)) {
+      return "目前尚未正式派車，如需叫車請確認上車與下車地點。";
+    }
+    return "目前沒有進行中的叫車，如需叫車請提供上車與下車地點。";
+  }
+
+  const status = String(active.status ?? "").toLowerCase();
+  if (status === "waiting") {
+    return "目前還在幫您尋車中，有車會立刻通知您。";
+  }
+  if (status === "matched") {
+    return "目前已為您安排司機，車輛抵達會再通知您。";
+  }
+  if (status === "arrived") {
+    return "司機已到達附近，請留意訊息或現場車輛。";
+  }
+  if (status === "onboard" || status === "done") {
+    return "目前這筆行程已進入上車或完成狀態。";
+  }
+  return "目前沒有進行中的叫車，如需叫車請提供上車與下車地點。";
 }
 
 function detectSpecialServiceRequest(text, merged) {
