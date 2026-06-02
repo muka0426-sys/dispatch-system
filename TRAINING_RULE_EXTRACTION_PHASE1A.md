@@ -384,3 +384,49 @@
 3. **人工 spot-check（建議）** — 6 筆 direct 雖已標可用，仍建議人工確認無 group 混入、無個資外洩風險後，才進 Phase 1b。
 4. **Phase 1b（待 GPT 核准後）** — 30 筆 unknown 可能補足問價、口語叫車、邊界 cancel；**不可跳過人工 gate**。
 5. **不建議現階段改 `server.js` / `ai_v7.js`** — 樣本少且多為人工客服流程，自動 bot 不可直接照搬。
+
+## GPT Review Result
+
+- **Review status:** reviewed by GPT, document only
+
+### Approved as document rules（可保留為文件規則，仍不得進程式）
+
+| Rule ID | 摘要 |
+|---------|------|
+| P0-A-002 | 派車狀態追問不是新單 |
+| P0-A-004 | 已在別處叫到車 → 取消本單 |
+| P0-C-001 | 明確放棄用詞 |
+| P0-C-002 | 單字 / 短句取消 |
+| P0-C-005 | 尋車失敗後取消 |
+| P0-D-001 | 代買需 special lock |
+| P0-D-002 | 跑腿 / 運送需 special lock |
+| P0-B-002 | 官方公式 vs 人工話術，只能當文件對照 |
+
+### Downgraded to gaps（降級為缺口 / 待更多樣本）
+
+| Rule ID | 摘要 |
+|---------|------|
+| P0-B-003 | 純路線估價（evidence 0） |
+| P0-B-004 | 機場定額詢問（evidence 0） |
+| P0-D-005 | 寵物 / 行李多（evidence 0） |
+
+### High-risk / do not implement（保留但標高風險，不准進程式）
+
+| Rule ID | 摘要 |
+|---------|------|
+| P0-A-001 | 非叫車服務詢問；樣本少且可能與叫車意圖並存 |
+| P0-B-001 | 計費公式詢問；可能是 quote gate 缺口，需更多樣本 |
+| P0-C-003 | 「取消嗎」客服問句；屬人工多輪語境 |
+| P0-A-003 | 尋車等待 / 無車循環；依賴目前 bot 未完整管理的等待狀態 |
+| P0-A-005 | 同時多平台叫車；需要完整上下文 |
+| P0-D-003 | 代買 + 複合計費；只能人工報價 |
+| P0-D-004 | 大車 / 休旅；證據弱 |
+| P0-C-004 | 已派司機後取消；涉及取消費 / 空趟費 / 人工政策 |
+
+### Global decision
+
+Phase 1a 結果**只能**作為文件規則候選；**不得**直接進 `server.js` / `utils/ai_v7.js` / `rules/dispatch_rules_v1.js`。
+
+### Next step
+
+若要進程式，必須**另開單一規則任務**，從 **evidence 高、與現有 gate 一致**的規則開始（優先參考上方 Approved 清單）。
