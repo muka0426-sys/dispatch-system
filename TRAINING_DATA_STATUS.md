@@ -131,6 +131,7 @@ Hermes README 另註：`skipped_other`、`skipped_group` 等類別存在；詳�
 ## 7. Current next step
 
 - 第一階段：只建立文件型訓練資料狀態（本檔 + `PROJECT_STATE.md` 指向）。
+- **規則萃取計畫檔：** `TRAINING_RULE_EXTRACTION_PLAN.md` — 目前僅建立計畫，**不進行萃取**。
 - 下一步（待 GPT 審查）：可考慮 `training_index.json` / csv，**目前先不做**。
 - 不接 `server.js`、不移動資料、不訓練模型。
 - 新增抓取資料時，應更新 manifest 或重新掃描後再更新本檔統計。
