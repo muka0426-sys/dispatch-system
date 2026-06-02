@@ -105,6 +105,8 @@
 - **詳細訓練資料狀態以 `TRAINING_DATA_STATUS.md` 為準**（含可用 / 禁止 / 個資規則與統計）
 - **Gemini / Hermes 規則萃取輸出：** repo 內尚未找到；詳見 `TRAINING_DATA_STATUS.md`（Gemini / Hermes analysis outputs）
 - **訓練規則萃取計畫：** `TRAINING_RULE_EXTRACTION_PLAN.md` — 狀態：**planning only**；尚未開始萃取。
+- **Phase 1a 規則萃取：** 已建立草稿 `TRAINING_RULE_EXTRACTION_PHASE1A.md`；**尚未進程式**；狀態：**draft / pending GPT review**。
+- **外部 Gemini 原始輸入批次：** 已知存在一份「客群訓練模組：第一批實戰資料分析」；使用者回報完整且無亂碼；目前**未入庫、未去識別化**、**不可視為完成分析結果**；詳見 `TRAINING_DATA_STATUS.md`（External Gemini input batches）。
 - `LOBSTER_ARCHIVE_MANIFEST_20260523.txt` exists.
 - `RESTORE_LOBSTER_ARCHIVE_20260523.ps1` exists.
 - `.openclaw/workspace-state.json` exists.

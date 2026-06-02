@@ -128,10 +128,23 @@ Hermes README 另註：`skipped_other`、`skipped_group` 等類別存在；詳�
 - 若未來找到外部 Gemini 對話摘要（例如網頁對話、本機未入庫檔），必須**先去識別化**，再決定是否入庫。
 - 在 repo 內找到此類輸出之前，**不准**把「已訓練完成」或「已完成規則萃取」當作事實。
 
+## External Gemini input batches
+
+- 有一份**外部舊批次**，標題為「客群訓練模組：第一批實戰資料分析」。
+- 目前定位：**給 Gemini 的原始輸入資料 / 實戰資料包**（非 repo 內檔案）。
+- 使用者人工回報：內容**完整、沒有亂碼**。
+- repo 內目前**沒有保存**該批次原文。
+- 該批次**不可**視為 Gemini 完成分析結果。
+- 該批次**不可**視為已訓練完成。
+- 該批次**不可**原文入庫（仍可能含客戶原文、地址、司機資訊、車牌等敏感資料）。
+- 若未來要使用，必須先做**去識別化**、**mapping** 到 manifest / candidate 資料來源，再由 **GPT 審查**。
+- 目前**不打斷 Phase 1a**；Phase 1a 仍以 manifest `01_可用_有標記中文_direct` 的 **6 筆 direct** 為主。
+
 ## 7. Current next step
 
 - 第一階段：只建立文件型訓練資料狀態（本檔 + `PROJECT_STATE.md` 指向）。
 - **規則萃取計畫檔：** `TRAINING_RULE_EXTRACTION_PLAN.md` — 目前僅建立計畫，**不進行萃取**。
+- **Phase 1a direct 規則萃取結果：** `TRAINING_RULE_EXTRACTION_PHASE1A.md` — 狀態：**draft / pending GPT review**。
 - 下一步（待 GPT 審查）：可考慮 `training_index.json` / csv，**目前先不做**。
 - 不接 `server.js`、不移動資料、不訓練模型。
 - 新增抓取資料時，應更新 manifest 或重新掃描後再更新本檔統計。
