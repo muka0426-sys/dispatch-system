@@ -882,6 +882,14 @@ async function handleEvent(event) {
 
       const quote = detectPureQuoteIntent(text, merged);
       if (quote.hit && !confirmedQuoteThisTurn) {
+        const routeCheck = detectIncompleteQuoteRoute(merged);
+        if (routeCheck.incomplete) {
+          setDispatchDraft(userId, merged);
+          const incompleteMsg = buildIncompleteQuoteRouteReply(routeCheck, merged);
+          await reply(replyToken, incompleteMsg);
+          appendConversationTurn(userId, "assistant", incompleteMsg);
+          return;
+        }
         setPendingQuoteConfirmation(userId, {
           merged,
           estimated_fare_text: String(merged?.estimated_fare_text ?? "").trim(),
@@ -1749,6 +1757,104 @@ function normalizeQuotePendingText(text) {
     .toLowerCase()
     .replace(/[\s\r\n\t　]+/g, "")
     .replace(/[，。！？、,.!?；;：:「」『』（）()【】\[\]《》<>／\/\\\-＿_~～…·•]/g, "");
+}
+
+/** fare quote gate V1.2：與 ai_v7 地址加嚴口徑對齊（僅 server quote 用，不影響派車 Maps 函式）。 */
+function quoteRouteHasAdminDistrict(text) {
+  const t = String(text ?? "").trim();
+  if (!t) return false;
+  return /[^\s，,]{1,12}(區|鄉|鎮)/.test(t);
+}
+
+function quoteRouteIsOnlyRoadWithoutDistrict(text) {
+  const t = String(text ?? "").trim();
+  if (!t) return false;
+  if (/(區|鄉|鎮|市)/.test(t)) return false;
+  if (!/(路|街|大道|巷|弄)/.test(t)) return false;
+  return !quoteRouteHasAdminDistrict(t);
+}
+
+function quoteRouteHasExplicitLandmark(text) {
+  const t = String(text ?? "").trim();
+  if (!t) return false;
+  return /(夜市|車站|醫院|機場|桃園機場|桃機|航廈|百貨|大樓|學校|捷運|國小|國中|高中|大學|飯店|旅館|MRT|mall)/i.test(
+    t
+  ) || /(火車站|高鐵|轉運|交流道)/.test(t);
+}
+
+function quoteRouteHasPreciseAddressSignal(text) {
+  const t = String(text ?? "").trim();
+  if (!t) return false;
+  if (quoteRouteHasExplicitLandmark(t)) return true;
+  if (/\d+\s*號/.test(t)) return true;
+  if (quoteRouteHasAdminDistrict(t) && /(路|街|大道|巷|弄)/.test(t)) return true;
+  return false;
+}
+
+function quoteRouteIsDistrictOnlyLocation(text) {
+  const t = String(text ?? "").trim();
+  if (!t) return false;
+  if (quoteRouteHasExplicitLandmark(t)) return false;
+  if (/(路|街|大道|巷|弄|號)/.test(t)) return false;
+  const compact = t.replace(/\s/g, "");
+  if (/^[\u4e00-\u9fff]{2,10}(區|鄉|鎮|市)?$/.test(compact)) return true;
+  if (/市.+?(區|鄉|鎮)$/.test(compact)) return true;
+  return false;
+}
+
+/**
+ * fare quote gate V1.2：問價前檢查路線端點是否足夠精準，避免模糊地址直接估價。
+ * @returns {{ incomplete: boolean, reason: "missing_endpoint"|"pickup_imprecise"|"dropoff_imprecise"|"dropoff_district_only"|"ok" }}
+ */
+function detectIncompleteQuoteRoute(merged) {
+  const pickup = String(merged?.pickup ?? "").trim();
+  const dropoff = String(merged?.dropoff ?? "").trim();
+
+  if (!pickup || !dropoff) {
+    return { incomplete: true, reason: "missing_endpoint" };
+  }
+
+  if (!quoteRouteHasPreciseAddressSignal(pickup)) {
+    if (quoteRouteIsOnlyRoadWithoutDistrict(pickup) || !quoteRouteHasAdminDistrict(pickup)) {
+      return { incomplete: true, reason: "pickup_imprecise" };
+    }
+    if (/(路|街|大道|巷|弄)/.test(pickup) && !/\d+\s*號/.test(pickup)) {
+      return { incomplete: true, reason: "pickup_imprecise" };
+    }
+  }
+
+  if (quoteRouteIsDistrictOnlyLocation(dropoff)) {
+    return { incomplete: true, reason: "dropoff_district_only" };
+  }
+
+  if (!quoteRouteHasPreciseAddressSignal(dropoff)) {
+    if (quoteRouteIsOnlyRoadWithoutDistrict(dropoff) || quoteRouteIsDistrictOnlyLocation(dropoff)) {
+      return { incomplete: true, reason: "dropoff_imprecise" };
+    }
+    if (!quoteRouteHasAdminDistrict(dropoff) && !quoteRouteHasExplicitLandmark(dropoff)) {
+      return { incomplete: true, reason: "dropoff_imprecise" };
+    }
+  }
+
+  return { incomplete: false, reason: "ok" };
+}
+
+function buildIncompleteQuoteRouteReply(routeCheck, merged) {
+  const pickup = String(merged?.pickup ?? "").trim();
+  const dropoff = String(merged?.dropoff ?? "").trim();
+  if (!pickup && dropoff) {
+    return "可以，為了幫您估算比較準，請提供完整上車地址。";
+  }
+  if (pickup && !dropoff) {
+    return "可以，為了幫您估算比較準，請提供完整下車地址。";
+  }
+  if (routeCheck.reason === "pickup_imprecise") {
+    return "可以，為了幫您估算比較準，請提供完整上車地址。";
+  }
+  if (routeCheck.reason === "dropoff_district_only" || routeCheck.reason === "dropoff_imprecise") {
+    return "可以，為了幫您估算比較準，請提供完整下車地址。";
+  }
+  return "可以，為了幫您估算比較準，請提供完整上車地址與下車地址。";
 }
 
 function detectPureQuoteIntent(text, _merged) {
