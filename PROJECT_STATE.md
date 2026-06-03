@@ -67,6 +67,12 @@
   - 6.0 km → 170
   - 6.1 km → 190
 
+## 3.5 Architecture / AI (document only)
+
+- **AI dispatcher role definition：** `AI_DISPATCHER_ROLE.md`
+- **AI decision schema draft：** `AI_DECISION_SCHEMA_DRAFT.md`
+- **狀態：** document only；**尚未改** `utils/ai_v7.js`；**尚未接入** `server.js`
+
 ## 4. Current deployment notes
 
 - `origin/main` 已曾指向 `8e16fdb`。
