@@ -861,6 +861,18 @@ async function handleEvent(event) {
         now: currentDateTime
       });
 
+      if (ai) {
+        console.log("[AI decision]", {
+          userId,
+          intent: ai?.decision?.intent,
+          action: ai?.decision?.action,
+          should_dispatch: ai?.decision?.should_dispatch,
+          should_quote_only: ai?.decision?.should_quote_only,
+          confidence: ai?.decision?.confidence,
+          reason: ai?.decision?.reason
+        });
+      }
+
       let merged = contextDraft;
       if (ai) {
         merged = mergeDispatchDraft(contextDraft, ai.draft);
