@@ -133,17 +133,18 @@
 
 ## 4. Current deployment notes
 
+- **本地 repo HEAD：** `13c6ec9`（`feat(customer): require precise route for fare quote` / fare quote V1.2 incomplete route）。**父提交** `2463a70`（AI decision log-only）在歷史中，但本機目前**不是**停在 `2463a70`。
+- **Railway 目前 running commit SHA：未確認。** 使用者曾回報 rollback；**不假設** rollback 已成功、**不假設**線上等於 `2463a70` 或本機 HEAD。操作前必須對照 Railway Dashboard Deployments / Logs。
+- 若線上 SHA 不是安全版（例如仍為 `13c6ec9` 或未知）：**停止 LINE 測試與部署操作**，回報使用者後再進行。
 - `origin/main` 已曾指向 `8e16fdb`。
-- Railway 曾經跑到舊 commit `cca6e97`，後來用空 commit 觸發 redeploy。（需以 Railway Deployments / Logs 驗證）
-- Railway 最新 boot log 曾顯示 `railwayGitSha: 0fd248d3649e3610940e35387c29dc8231d9edc7`。（需以最新 logs / deployment 頁面確認實際 running SHA）
-- origin/main 尚未包含 `076a2f2`。
-- 本地 main ahead of origin/main by 1 commit。
-- Railway 是否已部署 `076a2f2`：not verified。
-- origin/main 尚未包含 `8221c73`。
-- Railway 尚未部署 `8221c73`。
-- 不要假設部署成功；每次測試前確認 Railway running SHA。
+- Railway 曾經跑到舊 commit `cca6e97`，後來用空 commit 觸發 redeploy。（歷史紀錄，需以 Dashboard 驗證）
+- Railway 最新 boot log 曾顯示 `railwayGitSha: 0fd248d3649e3610940e35387c29dc8231d9edc7`。（**過時可能**，需以最新 logs 確認）
+- origin/main 尚未包含 `076a2f2` / `8221c73` 等較新本地 commit 之情況：**以 git log 與 Dashboard 為準**。
+- 不要假設部署成功。
 
 ## 5. Latest important test observations
+
+（**歷史測試紀錄**；目前**暫停**針對 `13c6ec9` / 問價的 LINE 測試與修補，見 **§8**。）
 
 - 問價誤派車大洞已由 fare_quote_gate V1 修正方向處理（問價不再直接派車）。
 - 線上測試「你幫我算 林森北路409號到三重三和夜市多少錢？」已不再回「已為您派車」。
@@ -176,6 +177,8 @@
 - `.openclaw/workspace-state.json` exists.
 - 龍蝦 / OpenClaw 曾用來抓 LINE 客戶對話紀錄；這些資料是未來訓練 / 規則萃取的重要來源。
 - 需要注意亂碼資料不可直接作為訓練資料（manifest 約 443 筆 `LooksGarbled`；見 `TRAINING_DATA_STATUS.md`）。
+- **去識別化規劃：** `TRAINING_DATA_PRIVACY_PLAN.md`
+- **資料索引（無原文）：** `TRAINING_DATA_INVENTORY.md`
 
 ## 7. Important existing reference files
 
@@ -184,12 +187,24 @@
 - `LOBSTER_ARCHIVE_MANIFEST_20260523.txt`：lobster archive manifest
 - `hermes_training_pack_20260523_040314/hermes_training_manifest.csv`：training data manifest
 - `TRAINING_RULE_EXTRACTION_PLAN.md`：規則萃取計畫（planning only）
+- `TRAINING_DATA_PRIVACY_PLAN.md`：去識別化與訓練資料安全規劃
+- `TRAINING_DATA_INVENTORY.md`：資料來源索引（無原文、無個資 key）
 
 ## 8. Current next step
 
-- 先驗收 `PROJECT_STATE.md`。
-- 再 commit `PROJECT_STATE.md`。
-- 再 push main。
-- 再確認 Railway running SHA。
-- 最後只測一題問價。
+**目前主線：訓練資料與真人派單員邏輯萃取（不是繼續修問價 bug、不是部署 `13c6ec9` 問價驗收）。**
+
+1. **先確認 Railway Dashboard 目前 running commit SHA** — **不假設** rollback 成功。
+2. **若線上不是安全版** — 停止 LINE 測試與部署操作，回報使用者。
+3. **暫停** `13c6ec9`（`feat(customer): require precise route for fare quote`）的 LINE 測試與修補；**不改** `server.js` / `utils/ai_v7.js` 派車主線（除非另開 GPT 任務包）。
+4. **進入訓練資料主線：**
+   - 以 `data_quality_manifest.csv` / `hermes_training_manifest.csv` 為**索引**（manifest 不是訓練內容）。
+   - 優先盤點 `hermes_candidate_usable_data/`（**36** 筆 CandidateUsable；**不是**完整訓練全集）。
+   - 依 `TRAINING_DATA_PRIVACY_PLAN.md` 設計並執行**去識別化**（不讀全量敏感原文；不把原始聊天與個資 commit 進 repo）。
+   - Hermes pack：**6** direct 優先、**30** unknown 需人工抽樣、**443** garbled **禁止**。
+   - **禁止**啟用 `_LOBSTER_ARCHIVE_DO_NOT_USE_20260523`。
+5. **外部「客群訓練模組：第一批實戰資料分析」** — 不在 repo；等使用者提供實體位置或舊視窗紀錄後，再決定是否納入（須先去識別化 + GPT 審查）。
+6. **後續（文件通過後）** — 萃取真人派單員判斷邏輯 → 再評估 AI decision 改善；**不接** `server.js` 直到另開任務包。
+
+**已暫停（勿再當預設下一步）：** 只測一題問價、`13c6ec9` 問價驗收、繼續補 route precision gate 的 LINE 實測與部署。
 
