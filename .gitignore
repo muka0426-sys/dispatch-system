@@ -2,3 +2,25 @@ node_modules/
 .env
 *.log
 .DS_Store
+
+# Local training / de-identified sample outputs
+training_deidentified_output/
+_local_training_samples/
+*_deidentified_*
+
+# Captured LINE / OpenClaw data and sensitive indexes
+line_text_capture_test/
+line_capture_test/
+line_customers_capture/
+hermes_candidate_usable_data/
+hermes_training_pack_*/
+captured_*.json
+stable_captured_*.json
+backup_captured_*.json
+line_snapshot.txt
+
+# Local backups
+*.bak
+*.bak_*
+*_bak_*
+PROJECT_STATE.md.bak_*
