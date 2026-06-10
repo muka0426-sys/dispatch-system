@@ -35,10 +35,13 @@ $Script:TokName = "[$([char]0x59D3)$([char]0x540D)]"
 $Script:TokCustomer = "[$([char]0x5BA2)$([char]0x4EBA)]"
 $Script:TokDispatcher = "[$([char]0x6D3E)$([char]0x55AE)$([char]0x54E1)]"
 $Script:TokDriver = "[$([char]0x53F8)$([char]0x6A5F)]"
+$Script:TokDispatchInfo = "[$([char]0x6D3E)$([char]0x8ECA)$([char]0x8CC7)$([char]0x8A0A)]"
+# Address keywords (exclude li/里 char code — avoids false match inside mileage/里程)
 $Script:AddressKeywordList = @(
-  [char]0x5E02, [char]0x7E23, [char]0x5340, [char]0x9109, [char]0x939A, [char]0x91CC,
+  [char]0x5E02, [char]0x7E23, [char]0x5340, [char]0x9109, [char]0x939A,
   [char]0x8DEF, [char]0x8857, [char]0x5DF7, [char]0x5F04, [char]0x865F, [char]0x6A13, [char]0x6BB5
 ) | ForEach-Object { [string]$_ }
+$Script:MileageWord = -join @([char]0x91CC, [char]0x7A0B)
 $Script:ShortReplyBlocklist = @(
   [char]0x597D, [char]0x5C0D, [char]0x662F, [char]0x55EF, [char]0x54E6, [char]0x554A,
   [char]0x6536, [char]0x53EF, [char]0x884C, [char]0x5728, [char]0x55E8, [char]0x7684,
@@ -130,7 +133,120 @@ function Test-IsChatSystemLine {
   if ($trimmed -match '^\d{1,2}:\d{2}$') { return $true }
   if ($trimmed -match '^\d{1,2}/\d{1,2}') { return $true }
   if ($trimmed -eq (-join @([char]0x5DF2, [char]0x8B80))) { return $true }
+  if ($trimmed -match '^_+$') { return $true }
+  if ($trimmed -match '^[=≡]+$') { return $true }
   return $false
+}
+
+function Test-LineHasAddressKeyword {
+  param([string] $Line)
+
+  if ($Line.Contains($Script:MileageWord)) {
+    return $false
+  }
+
+  foreach ($kw in $Script:AddressKeywordList) {
+    if ($Line.Contains($kw)) {
+      return $true
+    }
+  }
+  return $false
+}
+
+function Test-IsEmojiDisplayNameLine {
+  param([string] $Line)
+
+  $trimmed = $Line.Trim()
+  if ($trimmed.Length -gt 30) { return $false }
+  if ($trimmed -match '(司機|駕駛|派車|客服|回報|感謝|取消|叫車|尋車|分鐘|地址|上車|下車)') {
+    return $false
+  }
+
+  $hasEmoji = $false
+  if ($trimmed -match '[\uD800-\uDBFF][\uDC00-\uDFFF]') { $hasEmoji = $true }
+  if ($trimmed -match '[^\u0000-\u007F\u4e00-\u9fff\s，。！？、．：；\-_\[\]（）()]') { $hasEmoji = $true }
+
+  if (-not $hasEmoji) { return $false }
+  if ($trimmed.Length -le 20) { return $true }
+
+  $cjkCount = ([regex]::Matches($trimmed, '[\u4e00-\u9fff]')).Count
+  return ($cjkCount -le 6)
+}
+
+function Invoke-DispatchAndRouteRedactionForLine {
+  param(
+    [string] $Line,
+    [ref] $Warnings
+  )
+
+  $trimmed = $Line.Trim()
+  if ([string]::IsNullOrWhiteSpace($trimmed)) {
+    return $Line
+  }
+
+  if ($trimmed -match '(司機資訊|派車資訊|駕駛資訊)') {
+    Add-Warning -WarningList $Warnings -Message "Matched dispatch info header; replaced with $Script:TokDispatchInfo."
+    return $Script:TokDispatchInfo
+  }
+
+  if ($trimmed -match '^(上車|下車|起點|終點|上車地點|下車地點)[：:]\s*(.+)$') {
+    Add-Warning -WarningList $Warnings -Message "Matched route field; replaced value with $Script:TokAddress."
+    $label = $matches[1]
+    $colon = if ($trimmed.Contains(':')) { ':' } else { '：' }
+    return "$label$colon$Script:TokAddress"
+  }
+
+  if ($trimmed -match '^(司機|駕駛)[：:]\s*(.+)$') {
+    Add-Warning -WarningList $Warnings -Message "Matched driver field; replaced with $Script:TokDriver."
+    $label = $matches[1]
+    $colon = if ($trimmed.Contains(':')) { ':' } else { '：' }
+    return "$label$colon$Script:TokDriver"
+  }
+
+  if ($trimmed -match '^(車牌|車號)[：:]\s*(.+)$') {
+    Add-Warning -WarningList $Warnings -Message "Matched plate field; replaced with $Script:TokPlate."
+    $label = $matches[1]
+    $colon = if ($trimmed.Contains(':')) { ':' } else { '：' }
+    return "$label$colon$Script:TokPlate"
+  }
+
+  if ($trimmed -match '^(車型|車款|車色|顏色)[：:]\s*(.+)$') {
+    Add-Warning -WarningList $Warnings -Message "Matched vehicle detail field; replaced with $Script:TokDispatchInfo."
+    return $Script:TokDispatchInfo
+  }
+
+  if ($trimmed -match '(車牌|車號)') {
+    Add-Warning -WarningList $Warnings -Message "Matched plate keyword in line; replaced line with $Script:TokDispatchInfo."
+    return $Script:TokDispatchInfo
+  }
+
+  return $null
+}
+
+function Invoke-EnglishPrefixRedactionForLine {
+  param(
+    [string] $Line,
+    [ref] $Warnings
+  )
+
+  if ($Line -match '^(?<prefix>[A-Za-z]{2,15})(?<rest>[\u4e00-\u9fff].*)$') {
+    Add-Warning -WarningList $Warnings -Message "Matched English staff prefix; replaced with $Script:TokDispatcher."
+    return ($Script:TokDispatcher + $Matches['rest'])
+  }
+  return $Line
+}
+
+function Invoke-EmojiDisplayNameRedactionForLine {
+  param(
+    [string] $Line,
+    [ref] $Warnings
+  )
+
+  if (Test-IsEmojiDisplayNameLine -Line $Line) {
+    Add-Warning -WarningList $Warnings -Message "Matched emoji display name; replaced with $Script:TokName."
+    return $Script:TokName
+  }
+  return $Line
 }
 
 function Invoke-NameRedactionForLine {
@@ -191,7 +307,7 @@ function Add-PossibleNameRemainingWarnings {
 
   $tokenValues = @(
     $Script:TokName, $Script:TokCustomer, $Script:TokDispatcher, $Script:TokDriver,
-    $Script:TokAddress, $Script:TokPhone, $Script:TokPlate, $Script:TokId
+    $Script:TokAddress, $Script:TokPhone, $Script:TokPlate, $Script:TokId, $Script:TokDispatchInfo
   )
 
   $lines = $Text -split "\r?\n"
@@ -251,45 +367,47 @@ function Invoke-DeidentifyText {
     $result = [regex]::Replace($result, $longTokenPattern, $Script:TokId)
   }
 
-  # Phone numbers and 8+ digit runs
+  # Phone numbers and 8+ digit runs (line-level later; skip global plate regex in v1.2)
   $phonePattern = '(?<!\d)(?:\+?886[-\s]?)?0?\d{1,2}[-\s]?\d{3,4}[-\s]?\d{4}\b|\b\d{8,}\b'
   if ($result -match $phonePattern) {
     Add-Warning -WarningList $Warnings -Message "Matched phone or long digit run; replaced with $Script:TokPhone."
     $result = [regex]::Replace($result, $phonePattern, $Script:TokPhone)
   }
 
-  # Common Taiwan license plate formats
-  $platePatterns = @(
-    '[A-Z]{2,3}-?\d{3,4}',
-    '[A-Z0-9]{2,4}-?\d{2,4}',
-    '\d{2,4}-?[A-Z]{2,4}'
-  )
-  foreach ($pattern in $platePatterns) {
-    if ($result -match $pattern) {
-      Add-Warning -WarningList $Warnings -Message "Matched possible license plate; replaced with $Script:TokPlate."
-      $result = [regex]::Replace($result, $pattern, $Script:TokPlate)
-    }
-  }
-
-  # Address-like lines: replace whole line if it contains common TW address keywords
-  $addressKeywordList = $Script:AddressKeywordList
   $lineEnding = [Environment]::NewLine
   $lineList = $result -split "\r?\n"
   $redactedLines = foreach ($line in $lineList) {
-    $hasAddressKeyword = $false
-    foreach ($kw in $addressKeywordList) {
-      if ($line.Contains($kw)) {
-        $hasAddressKeyword = $true
-        break
-      }
+    $trimmed = $line.Trim()
+    if (Test-IsChatSystemLine -Line $trimmed) {
+      $line
+      continue
     }
-    if ($hasAddressKeyword) {
+
+    $dispatchRedacted = Invoke-DispatchAndRouteRedactionForLine -Line $line -Warnings $Warnings
+    if ($null -ne $dispatchRedacted) {
+      $dispatchRedacted
+      continue
+    }
+
+    $emojiRedacted = Invoke-EmojiDisplayNameRedactionForLine -Line $line -Warnings $Warnings
+    if ($emojiRedacted -ne $line) {
+      $emojiRedacted
+      continue
+    }
+
+    $englishRedacted = Invoke-EnglishPrefixRedactionForLine -Line $line -Warnings $Warnings
+    if ($englishRedacted -ne $line) {
+      $englishRedacted
+      continue
+    }
+
+    if (Test-LineHasAddressKeyword -Line $line) {
       Add-Warning -WarningList $Warnings -Message "Matched address-like line; replaced with $Script:TokAddress."
       $Script:TokAddress
+      continue
     }
-    else {
-      Invoke-NameRedactionForLine -Line $line -Warnings $Warnings
-    }
+
+    Invoke-NameRedactionForLine -Line $line -Warnings $Warnings
   }
   $result = $redactedLines -join $lineEnding
 
