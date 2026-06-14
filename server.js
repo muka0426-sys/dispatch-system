@@ -868,8 +868,12 @@ async function handleEvent(event) {
           action: ai?.decision?.action,
           should_dispatch: ai?.decision?.should_dispatch,
           should_quote_only: ai?.decision?.should_quote_only,
+          should_cancel: ai?.decision?.should_cancel,
+          should_hold: ai?.decision?.should_hold,
+          should_escalate: ai?.decision?.should_escalate,
           confidence: ai?.decision?.confidence,
-          reason: ai?.decision?.reason
+          reason: ai?.decision?.reason,
+          next_action: ai?.decision?.next_action
         });
       }
 
