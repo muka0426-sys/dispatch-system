@@ -196,17 +196,22 @@ ${JSON.stringify(String(messageText ?? ""))}
   "missing": [],
   "decision": {
     "intent": "dispatch_request|quote_request|cancel_request|status_inquiry|modify_order|special_request|chitchat|unknown",
-    "action": "ask_followup|quote_only|dispatch_candidate|status_reply|hold_for_confirmation|escalate_to_human|ignore",
+    "action": "ask_followup|quote_only|dispatch_candidate|cancel_candidate|status_reply|hold_for_confirmation|escalate_to_human|ignore",
     "should_dispatch": false,
     "should_quote_only": false,
+    "should_cancel": false,
+    "should_hold": false,
+    "should_escalate": false,
     "confidence": "high|medium|low",
-    "reason": "short de-identified explanation in English or 繁中，勿含姓名電話地址門牌 userId"
+    "reason": "short de-identified explanation in English or 繁中，勿含姓名電話地址門牌 userId",
+    "next_action": "machine-readable hint e.g. confirm_cancel|wait_driver_update|quote_only|escalate_to_human"
   }
 }
 
 【decision（派車專員建議，僅供系統記錄）】
 - decision 是觀察用分類，**不能**取代 server 的 gate 或地圖驗證。
-- reason 必須極短、去識別化；禁止貼客人原文、完整地址、電話、姓名、userId。
+- reason / next_action 必須極短、去識別化；禁止貼客人原文、完整地址、電話、姓名、userId。
+- wait_driver_update、quote_abandoned、weak_location_update 等語意請寫在 next_action 或 reason，**不要**新增 intent。
 `.trim();
 }
 
@@ -225,6 +230,7 @@ const DECISION_ACTIONS = new Set([
   "ask_followup",
   "quote_only",
   "dispatch_candidate",
+  "cancel_candidate",
   "status_reply",
   "hold_for_confirmation",
   "escalate_to_human",
@@ -233,7 +239,7 @@ const DECISION_ACTIONS = new Set([
 
 const DECISION_CONFIDENCE = new Set(["high", "medium", "low"]);
 
-/** Phase 1：AI 派車專員 decision 草案；無效輸入回安全預設，避免 server 解構失敗。 */
+/** Phase 1 log-only v2：AI 派車專員 decision；無效輸入回安全預設，避免 server 解構失敗。 */
 export function normalizeDecision(rawDecision) {
   const d = rawDecision && typeof rawDecision === "object" && !Array.isArray(rawDecision) ? rawDecision : {};
   const intentRaw = String(d.intent ?? "").trim();
@@ -244,22 +250,34 @@ export function normalizeDecision(rawDecision) {
     action: DECISION_ACTIONS.has(actionRaw) ? actionRaw : "ask_followup",
     should_dispatch: Boolean(d.should_dispatch),
     should_quote_only: Boolean(d.should_quote_only),
+    should_cancel: Boolean(d.should_cancel),
+    should_hold: Boolean(d.should_hold),
+    should_escalate: Boolean(d.should_escalate),
     confidence: DECISION_CONFIDENCE.has(confRaw) ? confRaw : "low",
-    reason: sanitizeDecisionReason(d.reason)
+    reason: sanitizeDecisionReason(d.reason),
+    next_action: sanitizeDecisionNextAction(d.next_action)
   };
 }
 
-function sanitizeDecisionReason(raw) {
+function sanitizeDecisionText(raw, { maxLen = 120, emptyDefault = "unspecified" } = {}) {
   let s = String(raw ?? "")
     .trim()
     .replace(/[\r\n\t]+/g, " ")
     .replace(/\s{2,}/g, " ");
-  if (!s) return "unspecified";
+  if (!s) return emptyDefault;
   s = s.replace(/\b09\d{8}\b/g, "[redacted]");
   s = s.replace(/\bU[a-f0-9]{32}\b/gi, "[redacted]");
   s = s.replace(/\b\d{7,}\b/g, "[redacted]");
-  if (s.length > 120) s = `${s.slice(0, 117)}...`;
-  return s || "unspecified";
+  if (s.length > maxLen) s = `${s.slice(0, Math.max(0, maxLen - 3))}...`;
+  return s || emptyDefault;
+}
+
+function sanitizeDecisionReason(raw) {
+  return sanitizeDecisionText(raw, { maxLen: 120, emptyDefault: "unspecified" });
+}
+
+function sanitizeDecisionNextAction(raw) {
+  return sanitizeDecisionText(raw, { maxLen: 80, emptyDefault: "" });
 }
 
 function normalizeRouteKey(pickup, dropoff) {
@@ -918,8 +936,12 @@ async function generateContentWithGeminiFallback(apiKey, prompt) {
  *     action: string,
  *     should_dispatch: boolean,
  *     should_quote_only: boolean,
+ *     should_cancel: boolean,
+ *     should_hold: boolean,
+ *     should_escalate: boolean,
  *     confidence: string,
- *     reason: string
+ *     reason: string,
+ *     next_action: string
  *   }
  * } | null>}
  */
