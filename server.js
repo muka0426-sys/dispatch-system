@@ -55,7 +55,7 @@ const users = {};
 // 防重複
 const handledEvents = new Set();
 
-const DRIVER_GROUP_ID = "C0227c4e4d8988002cfcd6527a43d3ad3";
+const DRIVER_GROUP_ID = (process.env.DRIVER_GROUP_ID || "C0227c4e4d8988002cfcd6527a43d3ad3").trim();
 const ADMIN_GROUP_ID = (process.env.ADMIN_GROUP_ID || "").trim(); // keep for logs; pushes must use process.env.ADMIN_GROUP_ID
 
 const KB_FILE = "knowledge_base.json";
