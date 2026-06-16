@@ -884,6 +884,13 @@ async function handleEvent(event) {
         setDispatchDraft(userId, merged);
       }
 
+      const serviceGate = checkServiceAreaGate({ text, pickup: merged.pickup, dropoff: merged.dropoff });
+      if (!serviceGate.ok) {
+        await reply(replyToken, serviceGate.reply);
+        appendConversationTurn(userId, "assistant", serviceGate.reply);
+        return;
+      }
+
       const quote = detectPureQuoteIntent(text, merged);
       if (quote.hit && !confirmedQuoteThisTurn) {
         setPendingQuoteConfirmation(userId, {
@@ -1662,6 +1669,53 @@ function normalizeStatusInquiryProbe(text) {
     .toLowerCase()
     .replace(/[\s\r\n\t　]+/g, "")
     .replace(/[，。！？、,.!?；;：:「」『』（）()【】\[\]《》<>／\/\\\-＿_~～…·•]/g, "");
+}
+
+function checkServiceAreaGate({ text, pickup, dropoff }) {
+  const combined = [pickup, dropoff, text].filter(Boolean).join(" ");
+
+  const islandKeywords = ["澎湖", "馬公", "金門", "馬祖", "綠島", "蘭嶼", "小琉球"];
+  if (islandKeywords.some((k) => combined.includes(k))) {
+    return {
+      ok: false,
+      kind: "island_blocked",
+      reply: "目前外島地區暫時無法提供派車服務，我先幫您轉人工確認。"
+    };
+  }
+
+  const outOfServiceKeywords = [
+    "台中",
+    "臺中",
+    "彰化",
+    "南投",
+    "雲林",
+    "嘉義",
+    "台南",
+    "臺南",
+    "高雄",
+    "屏東",
+    "宜蘭",
+    "花蓮",
+    "台東",
+    "臺東",
+    "新竹",
+    "苗栗"
+  ];
+  if (outOfServiceKeywords.some((k) => combined.includes(k))) {
+    return {
+      ok: false,
+      kind: "out_of_service_area",
+      reply: "目前這個地區需要人工協助安排，我先幫您轉人工處理，請稍候。"
+    };
+  }
+
+  const allowKeywords = ["台北", "臺北", "新北", "基隆", "桃園", "中壢"];
+  if (allowKeywords.some((k) => combined.includes(k))) {
+    return { ok: true };
+  }
+
+  // 未命中任何明確地名時一律放行，避免常見路名（無縣市）被誤擋。
+  return { ok: true };
 }
 
 /** P0-A-002：純狀態追問（有嗎 / 到了嗎等），非新叫車 intent。 */
