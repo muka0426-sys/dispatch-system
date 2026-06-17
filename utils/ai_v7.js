@@ -948,6 +948,121 @@ async function generateContentWithGeminiFallback(apiKey, prompt) {
   throw lastErr ?? new Error("Gemini: no working model for this API key");
 }
 
+const PENDING_QUOTE_INTENTS = new Set([
+  "confirm_dispatch",
+  "cancel_quote",
+  "reprice",
+  "ask_more",
+  "unknown"
+]);
+
+export function normalizePendingQuoteAiResult(obj) {
+  if (!obj || typeof obj !== "object") {
+    return { intent: "unknown", confidence: "low", reason: "invalid_output", reply_hint: "" };
+  }
+  const intentRaw = String(obj.intent ?? "").trim();
+  const confRaw = String(obj.confidence ?? "").trim();
+  let intent = PENDING_QUOTE_INTENTS.has(intentRaw) ? intentRaw : "unknown";
+  const confidence = DECISION_CONFIDENCE.has(confRaw) ? confRaw : "low";
+  const reason = sanitizeDecisionReason(obj.reason);
+  const reply_hint = sanitizeDecisionText(obj.reply_hint, { maxLen: 80, emptyDefault: "" });
+  if (confidence === "low" && intent === "confirm_dispatch") {
+    return {
+      intent: "unknown",
+      confidence: "low",
+      reason: reason || "low_confidence_confirm_blocked",
+      reply_hint
+    };
+  }
+  return { intent, confidence, reason, reply_hint };
+}
+
+/**
+ * pending_quote_confirmation 後續回覆：僅分類意圖，不派車、不取消既有訂單。
+ */
+export async function classifyPendingQuoteReplyWithAi({
+  text,
+  pendingQuote,
+  conversationHistory,
+  now
+}) {
+  try {
+    const apiKey = (process.env.GEMINI_API_KEY || "").trim();
+    if (!apiKey) return null;
+
+    const messageText = String(text ?? "").trim();
+    if (!messageText) return null;
+
+    const merged = pendingQuote?.merged && typeof pendingQuote.merged === "object" ? pendingQuote.merged : {};
+    const pickup = String(merged.pickup ?? "").trim();
+    const dropoff = String(merged.dropoff ?? "").trim();
+    const fareText = String(
+      pendingQuote?.estimated_fare_text ?? merged.estimated_fare_text ?? ""
+    ).trim();
+    const triggerText = String(pendingQuote?.triggerText ?? "").trim();
+
+    const currentDateTime =
+      now instanceof Date && Number.isFinite(now.getTime()) ? now : new Date();
+    const clockDateStr = currentDateTime.toLocaleDateString("zh-TW");
+    const clockTimeStr = currentDateTime.toLocaleTimeString("zh-TW");
+    const conversationBlock = formatConversationBlockForPrompt(
+      Array.isArray(conversationHistory) ? conversationHistory.slice(-6) : []
+    );
+
+    const prompt = `你是 LINE 派車系統的 AI 真人派單員。
+目前客人剛剛已收到一筆報價，系統正在等待客人確認是否要叫車。
+你只需要判斷客人這一則回覆的意圖。
+你不能直接派車、不能取消既有訂單、不能跳過 server 安全檢查。
+
+【現在時間】${clockDateStr} ${clockTimeStr}
+
+【上一筆報價摘要】
+上車：${pickup || "（未提供）"}
+下車：${dropoff || "（未提供）"}
+車資說明：${fareText || "（未提供）"}
+${triggerText ? `觸發問價原文摘要：${triggerText.slice(0, 120)}` : ""}
+
+【近期對話】
+${conversationBlock || "（尚無）"}
+
+【客人最新回覆】
+${messageText}
+
+【安全規則】
+不要用單一關鍵字或子字串判斷。
+姓名、地址、備註中出現「叫」「叫車」「取消」不代表真的要叫車或取消。
+例如：「林叫車」可能是名字，不可直接判 confirm_dispatch。
+「田取消」可能是名字，不可直接判 cancel_quote。
+必須根據目前狀態與整句語意判斷。
+
+【分類定義】
+- confirm_dispatch：客人確認要叫車 / 要用車 / 要派車（如：要、來一台、趕快、馬上）
+- cancel_quote：不叫了 / 取消這次報價確認 / 先不用
+- reprice：重新問價 / 多少錢 / 車資 / 報價
+- ask_more：問其他問題，需回答或追問
+- unknown：無法判斷，不可派車
+
+confidence 為 low 時，不可輸出 confirm_dispatch。
+
+只輸出 JSON，不要 markdown：
+{
+  "intent": "confirm_dispatch|cancel_quote|reprice|ask_more|unknown",
+  "confidence": "high|medium|low",
+  "reason": "短原因，不含姓名電話地址門牌",
+  "reply_hint": "ask_more 或 unknown 時可給一句短追問，其他可空字串"
+}`;
+
+    const res = await generateContentWithGeminiFallback(apiKey, prompt);
+    const raw = res?.response?.text?.() ?? "";
+    const obj = extractJsonObject(raw);
+    if (!obj) return null;
+    return normalizePendingQuoteAiResult(obj);
+  } catch (err) {
+    console.error("[AI pending quote classify]", err?.message || err);
+    return null;
+  }
+}
+
 /**
  * @param {string} messageText
  * @param {{

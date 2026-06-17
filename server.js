@@ -16,7 +16,8 @@ import {
   getGoogleShortestRouteEstimate,
   estimateAirportFlatFareByKb,
   finalizeCustomerFareReply,
-  looksLikePricingQuestion
+  looksLikePricingQuestion,
+  classifyPendingQuoteReplyWithAi
 } from "./utils/ai_v7.js";
 
 console.log("[boot] server.js", {
@@ -685,12 +686,46 @@ async function handleEvent(event) {
       let confirmedQuoteThisTurn = false;
       const pendingQuote = getPendingQuoteConfirmation(userId);
       if (pendingQuote) {
-        const quoteReplyKind = classifyQuoteConfirmationReply(text);
+        const pendingQuoteFollowUpFallback =
+          "我確認一下，您是要我現在幫您叫車，還是只是想再確認車資？";
+        const convHistForQuote = getConversationLog(userId).slice(0, -1);
+        const aiQuoteClass = await classifyPendingQuoteReplyWithAi({
+          text,
+          pendingQuote,
+          conversationHistory: convHistForQuote,
+          now: new Date()
+        });
+
+        let quoteReplyKind = null;
+        if (aiQuoteClass) {
+          const conf = aiQuoteClass.confidence;
+          const intent = aiQuoteClass.intent;
+          if (intent === "confirm_dispatch" && (conf === "high" || conf === "medium")) {
+            quoteReplyKind = "confirm_dispatch";
+          } else if (intent === "cancel_quote" && (conf === "high" || conf === "medium")) {
+            quoteReplyKind = "cancel_quote";
+          } else if (intent === "reprice" && (conf === "high" || conf === "medium")) {
+            quoteReplyKind = "reprice";
+          } else {
+            const followUp =
+              String(aiQuoteClass.reply_hint ?? "").trim() || pendingQuoteFollowUpFallback;
+            await reply(replyToken, followUp);
+            appendConversationTurn(userId, "assistant", followUp);
+            return;
+          }
+        }
+
+        if (!quoteReplyKind) {
+          quoteReplyKind = classifyQuoteConfirmationReplyFallback(text);
+          if (quoteReplyKind === "unknown") {
+            await reply(replyToken, pendingQuoteFollowUpFallback);
+            appendConversationTurn(userId, "assistant", pendingQuoteFollowUpFallback);
+            return;
+          }
+        }
+
         if (quoteReplyKind === "cancel_quote") {
           clearPendingQuoteConfirmation(userId);
-          clearDispatchDraft(userId);
-          clearPendingDispatchConfirmation(userId);
-          setUserState(userId, "idle", { conversationLog: [] });
           const quoteAbandonMsg = "好的，先不幫您叫車，如有需要再跟我說。";
           await reply(replyToken, quoteAbandonMsg);
           appendConversationTurn(userId, "assistant", quoteAbandonMsg);
@@ -701,12 +736,6 @@ async function handleEvent(event) {
           clearPendingQuoteConfirmation(userId);
         } else if (quoteReplyKind === "reprice") {
           clearPendingQuoteConfirmation(userId);
-        } else {
-          const quoteConfirmMsg =
-            "好的，請問您現在要我幫您叫車嗎？如果確定要叫車，請回覆「要叫車」或「幫我叫」。";
-          await reply(replyToken, quoteConfirmMsg);
-          appendConversationTurn(userId, "assistant", quoteConfirmMsg);
-          return;
         }
       }
 
@@ -1830,13 +1859,8 @@ function detectPureQuoteIntent(text, _merged) {
   return { hit: reasons.length > 0, reasons: [...new Set(reasons)] };
 }
 
-function isQuoteBookingConfirmText(text) {
-  const p = normalizeQuotePendingText(text);
-  if (!p) return false;
-  return /要叫車|我要車|幫我叫車?|現在叫車?|叫車|派車|麻煩安排|安排/.test(p);
-}
-
-function classifyQuoteConfirmationReply(text) {
+/** AI 失敗時僅用於明確 reprice / cancel；不可本地 confirm 派車。 */
+function classifyQuoteConfirmationReplyFallback(text) {
   const raw = String(text ?? "").trim();
   const p = normalizeQuotePendingText(text);
   if (!p) return "unknown";
@@ -1845,16 +1869,8 @@ function classifyQuoteConfirmationReply(text) {
     return "reprice";
   }
 
-  if (/^(不用|先不用|算了|先算了|不要了?|我再想想|太貴|等等|晚點)$/.test(p)) {
+  if (/^(不用了?|先不用|算了|先算了|不要了?|我再想想|太貴|等等|晚點)$/.test(p)) {
     return "cancel_quote";
-  }
-
-  if (isQuoteBookingConfirmText(text)) {
-    return "confirm_dispatch";
-  }
-
-  if (/^(要|我要|好|好啊|好喔|可以|叫|叫阿|叫啊|幫我叫|要叫|現在叫|麻煩你|對|嗯)$/.test(p)) {
-    return "confirm_dispatch";
   }
 
   return "unknown";
