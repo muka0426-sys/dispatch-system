@@ -26,11 +26,17 @@ function clipReplyToMaxChars(text, max = REPLY_MAX_CHARS) {
   return chars.slice(0, Math.max(0, max - 1)).join("") + "…";
 }
 
+function replyAlreadyConfirmsDropoff(text) {
+  return /下車地點已(為您)?確認|已確認下車/.test(String(text ?? ""));
+}
+
 /** .cursorrules：盡量落在 30～50 字；過短時補一句不突兀的引導 */
-function ensureReplyLengthBand(text) {
+function ensureReplyLengthBand(text, options = {}) {
   const pad = "補一下地址或下車地點。";
   let t = clipReplyToMaxChars(String(text ?? "").trim(), REPLY_MAX_CHARS);
   if ([...t].length >= REPLY_TARGET_MIN) return t;
+  const hasDropoff = Boolean(options.hasDropoff);
+  if (hasDropoff || replyAlreadyConfirmsDropoff(t)) return t;
   t = clipReplyToMaxChars(`${t} ${pad}`, REPLY_MAX_CHARS);
   return t || clipReplyToMaxChars("收到，請補縣市區、路名門牌。", REPLY_MAX_CHARS);
 }
@@ -375,12 +381,17 @@ export function alignCustomerReplyToEstimatedFare(reply, estimatedFareText) {
   return `${t} ${tail}`.trim();
 }
 
-export function finalizeCustomerFareReply(reply, estimatedFareText, messageText = "") {
+export function finalizeCustomerFareReply(
+  reply,
+  estimatedFareText,
+  messageText = "",
+  options = {}
+) {
   const aligned = alignCustomerReplyToEstimatedFare(reply, estimatedFareText);
   if (guestMessageLooksLikeSubstantiveQuestion(messageText)) {
     return clipReplyToMaxChars(aligned, REPLY_MAX_CHARS_LONG);
   }
-  return ensureReplyLengthBand(aligned);
+  return ensureReplyLengthBand(aligned, options);
 }
 
 function enforceStrictReplyBans(reply) {
@@ -1303,7 +1314,12 @@ export async function parseOrderFromText(messageText, options = {}) {
           reply = stripUnwarrantedVehicleSurchargeClaims(reply, draft.vehicle_request_type);
           reply = ensureSurchargeQuestionInReply(reply, draft.vehicle_request_type);
           reply = suppressAddressReaskWhenPickupVerified(reply, pickup_verified, draft);
-          reply = finalizeCustomerFareReply(reply, draft.estimated_fare_text, messageText);
+          const hasDropoff = Boolean(
+            String(draft.dropoff ?? options.activeOrderContext?.dropoff ?? "").trim()
+          );
+          reply = finalizeCustomerFareReply(reply, draft.estimated_fare_text, messageText, {
+            hasDropoff
+          });
           reply = enforceStrictReplyBans(reply);
 
           return {

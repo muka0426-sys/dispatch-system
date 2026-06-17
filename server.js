@@ -1049,7 +1049,12 @@ async function handleEvent(event) {
         const safeLead = finalizeCustomerFareReply(
           stripDispatchMisleadingPhrases(ai.reply),
           merged.estimated_fare_text,
-          text
+          text,
+          {
+            hasDropoff: Boolean(
+              String(merged.dropoff ?? activeForDispatch?.dropoff ?? "").trim()
+            )
+          }
         );
 
         const fareChatOnly =
@@ -1211,7 +1216,12 @@ async function handleEvent(event) {
           return;
         }
 
-        const blindDispatchMsg = "已為您派車，請問下車地點是哪裡？";
+        const hasDropoffForReply = Boolean(
+          String(merged.dropoff ?? order.dropoff ?? "").trim()
+        );
+        const blindDispatchMsg = hasDropoffForReply
+          ? "已幫您安排車輛，司機資訊稍後提供，請稍候。"
+          : "已為您派車，請問下車地點是哪裡？";
         await reply(replyToken, blindDispatchMsg);
         appendConversationTurn(userId, "assistant", blindDispatchMsg);
         return;
