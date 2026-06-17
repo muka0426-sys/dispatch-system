@@ -880,20 +880,42 @@ function isGeminiModelNotFoundError(err) {
   return /\b404\b|not found|ListModels/i.test(msg);
 }
 
+function geminiErrorStatus(err) {
+  return err?.status ?? err?.cause?.status ?? err?.response?.status;
+}
+
+function geminiErrorText(err) {
+  return String(
+    `${err?.message ?? ""} ${err?.statusText ?? ""} ${err?.details ?? ""} ${err?.cause?.message ?? ""}`
+  );
+}
+
+function isGeminiRetryableError(err) {
+  const status = geminiErrorStatus(err);
+  if (status === 503 || status === 429) return true;
+  const text = geminiErrorText(err);
+  if (/high demand/i.test(text)) return true;
+  if (/Service Unavailable/i.test(text)) return true;
+  if (/RESOURCE_EXHAUSTED/i.test(text)) return true;
+  return false;
+}
+
 /**
  * 依序嘗試 apiVersion（v1 → v1beta）與多個模型 ID；避免單一模型在專案/區域下架造成整條解析 404。
+ * 503 / 429 高峰時會短暫等待後切換下一個模型（優先 flash-lite）。
  * 可設 GEMINI_MODEL 覆寫為鏈上第一順位。
  */
 async function generateContentWithGeminiFallback(apiKey, prompt) {
   const envOverride = (process.env.GEMINI_MODEL || "").trim();
   const modelIds = dedupeModelIds([
     envOverride,
-    FIXED_MODEL_ID,
     "gemini-2.5-flash",
     "gemini-2.5-flash-lite",
-    "gemini-2.0-flash"
+    "gemini-2.0-flash",
+    FIXED_MODEL_ID
   ]);
   const apiVersions = ["v1", "v1beta"];
+  const primaryModelId = modelIds[0] || FIXED_MODEL_ID;
 
   let lastErr = null;
   for (const apiVersion of apiVersions) {
@@ -902,13 +924,24 @@ async function generateContentWithGeminiFallback(apiKey, prompt) {
       try {
         const model = genAI.getGenerativeModel({ model: modelId }, { apiVersion });
         const res = await model.generateContent(prompt);
-        if (modelId !== FIXED_MODEL_ID) {
+        if (modelId !== primaryModelId) {
           console.warn("[AI] Gemini model fallback:", { apiVersion, modelId });
         }
         return res;
       } catch (err) {
         lastErr = err;
-        if (!isGeminiModelNotFoundError(err)) throw err;
+        if (isGeminiModelNotFoundError(err)) {
+          continue;
+        }
+        if (isGeminiRetryableError(err)) {
+          console.warn("[AI] Gemini model fallback retryable error:", {
+            status: geminiErrorStatus(err),
+            modelId
+          });
+          await sleep(250);
+          continue;
+        }
+        throw err;
       }
     }
   }
