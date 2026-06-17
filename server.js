@@ -698,6 +698,8 @@ async function handleEvent(event) {
         if (isQuoteBookingConfirmText(text)) {
           confirmedQuoteThisTurn = true;
           clearPendingQuoteConfirmation(userId);
+        } else if (detectPureQuoteIntent(text).hit) {
+          clearPendingQuoteConfirmation(userId);
         } else {
           const quoteConfirmMsg =
             "好的，請問您現在要我幫您叫車嗎？如果確定要叫車，請回覆「要叫車」或「幫我叫」。";
@@ -1875,11 +1877,15 @@ async function buildQuoteFareTextForDisplay(ai, merged) {
   const suffix = extractQuoteFareSuffixNotes(original);
   const pickup = String(merged?.pickup ?? "").trim();
   const dropoff = String(merged?.dropoff ?? "").trim();
+  const price = ai?.price == null ? null : Number(ai.price);
 
   if (pickup && dropoff) {
     const est = await getGoogleShortestRouteEstimate({ origin: pickup, destination: dropoff });
     if (est?.km) {
       return `參考里程 ${est.km}km，預估約 $${est.fare}${suffix}`;
+    }
+    if (Number.isFinite(price) && price > 0) {
+      return `預估約 $${Math.round(price)}${suffix}`;
     }
   }
 
@@ -1887,12 +1893,20 @@ async function buildQuoteFareTextForDisplay(ai, merged) {
     return original;
   }
 
-  const price = ai?.price == null ? null : Number(ai.price);
   if (Number.isFinite(price) && price > 0) {
-    return `約 $${Math.round(price)}${suffix}`;
+    return `預估約 $${Math.round(price)}${suffix}`;
   }
 
-  return original;
+  if (!isQuoteGenericFareFormulaText(original) && original) {
+    return original;
+  }
+
+  return "";
+}
+
+function isQuoteFareTextAlreadyQualified(fareText) {
+  const s = String(fareText ?? "").trim();
+  return /^(約\s*\$|約\$|預估約|參考里程)/.test(s);
 }
 
 function buildQuoteConfirmationMessage(merged) {
@@ -1900,15 +1914,20 @@ function buildQuoteConfirmationMessage(merged) {
   const dropoff = String(merged?.dropoff ?? "").trim();
   const fare = String(merged?.estimated_fare_text ?? "").trim();
   const route = pickup && dropoff ? `${pickup} → ${dropoff}` : "";
-  const fareStartsWithAboutMoney = /^約\s*\$/.test(fare) || /^約\$\d+/.test(fare);
+
+  if (!fare) {
+    return "目前暫時無法自動估算完整車資，我先幫您轉人工確認。";
+  }
+
+  const fareAlreadyQualified = isQuoteFareTextAlreadyQualified(fare);
 
   if (route && fare) {
-    return `收到，為您估算【${route}】車資${fareStartsWithAboutMoney ? "" : "約為 "}${fare}。此時尚未幫您叫車；如果確定要用車，請回覆「要叫車」或「幫我叫」。`;
+    return `收到，為您估算【${route}】車資${fareAlreadyQualified ? "" : "約為 "}${fare}。此時尚未幫您叫車；如果確定要用車，請回覆「要叫車」或「幫我叫」。`;
   }
   if (fare) {
-    return `收到，先幫您估算這趟車資${fareStartsWithAboutMoney ? "" : "約為 "}${fare}。此時尚未幫您叫車；如果確定要用車，請回覆「要叫車」或「幫我叫」。`;
+    return `收到，先幫您估算這趟車資${fareAlreadyQualified ? "" : "約為 "}${fare}。此時尚未幫您叫車；如果確定要用車，請回覆「要叫車」或「幫我叫」。`;
   }
-  return "收到，先幫您估算這趟車資。此時尚未幫您叫車；如果確定要用車，請回覆「要叫車」或「幫我叫」。";
+  return "目前暫時無法自動估算完整車資，我先幫您轉人工確認。";
 }
 
 function normalizeSpecialPendingText(text) {
