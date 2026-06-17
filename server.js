@@ -685,20 +685,21 @@ async function handleEvent(event) {
       let confirmedQuoteThisTurn = false;
       const pendingQuote = getPendingQuoteConfirmation(userId);
       if (pendingQuote) {
-        if (isQuoteAbandonText(text)) {
+        const quoteReplyKind = classifyQuoteConfirmationReply(text);
+        if (quoteReplyKind === "cancel_quote") {
           clearPendingQuoteConfirmation(userId);
           clearDispatchDraft(userId);
           clearPendingDispatchConfirmation(userId);
           setUserState(userId, "idle", { conversationLog: [] });
-          const quoteAbandonMsg = "好的，先不幫您叫車；如果還需要用車，再傳上車地點給我。";
+          const quoteAbandonMsg = "好的，先不幫您叫車，如有需要再跟我說。";
           await reply(replyToken, quoteAbandonMsg);
           appendConversationTurn(userId, "assistant", quoteAbandonMsg);
           return;
         }
-        if (isQuoteBookingConfirmText(text)) {
+        if (quoteReplyKind === "confirm_dispatch") {
           confirmedQuoteThisTurn = true;
           clearPendingQuoteConfirmation(userId);
-        } else if (detectPureQuoteIntent(text).hit) {
+        } else if (quoteReplyKind === "reprice") {
           clearPendingQuoteConfirmation(userId);
         } else {
           const quoteConfirmMsg =
@@ -1833,6 +1834,30 @@ function isQuoteBookingConfirmText(text) {
   const p = normalizeQuotePendingText(text);
   if (!p) return false;
   return /要叫車|我要車|幫我叫車?|現在叫車?|叫車|派車|麻煩安排|安排/.test(p);
+}
+
+function classifyQuoteConfirmationReply(text) {
+  const raw = String(text ?? "").trim();
+  const p = normalizeQuotePendingText(text);
+  if (!p) return "unknown";
+
+  if (/多少錢|車資|報價/.test(raw) || p === "多少" || /大概多少|約多少/.test(raw)) {
+    return "reprice";
+  }
+
+  if (/^(不用|先不用|算了|先算了|不要了?|我再想想|太貴|等等|晚點)$/.test(p)) {
+    return "cancel_quote";
+  }
+
+  if (isQuoteBookingConfirmText(text)) {
+    return "confirm_dispatch";
+  }
+
+  if (/^(要|我要|好|好啊|好喔|可以|叫|叫阿|叫啊|幫我叫|要叫|現在叫|麻煩你|對|嗯)$/.test(p)) {
+    return "confirm_dispatch";
+  }
+
+  return "unknown";
 }
 
 function isQuoteAbandonText(text) {
