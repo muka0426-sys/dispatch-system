@@ -1070,8 +1070,6 @@ async function handleEvent(event) {
         // 一單一卡：已標記成功（matched/arrived）後，乘客補齊或修改 → 不重噴整張卡。
         // 改為通知司機變動內容，並用口語回乘客「已幫你通知司機」。
         if (activeForDispatch && activeForDispatch.status !== "waiting") {
-          merged = ensureCustomerPickupTimeDefaultNow(merged);
-          setDispatchDraft(userId, merged);
           const orderBefore = {
             pickup: String(activeForDispatch.pickup || activeForDispatch.address || "").trim(),
             dropoff: String(activeForDispatch.dropoff || "").trim(),
@@ -1080,6 +1078,14 @@ async function handleEvent(event) {
             passengers: String(activeForDispatch.passengers || "").trim(),
             address: String(activeForDispatch.address || "").trim()
           };
+          if (!hasActiveOrderMaterialUpdateFromAi(ai, orderBefore)) {
+            const msg = "好的，司機資訊會再通知您。";
+            await reply(replyToken, msg);
+            appendConversationTurn(userId, "assistant", msg);
+            return;
+          }
+          merged = ensureCustomerPickupTimeDefaultNow(merged);
+          setDispatchDraft(userId, merged);
           applyMergedToActiveDispatchOrder(activeForDispatch, merged);
           if (ai?.ride_timestamp) {
             const n = normalizeRideTimestampYearTo2026(ai.ride_timestamp);
@@ -2324,6 +2330,40 @@ function summarizeOrderChangesForDriver(order, merged) {
   if (before.time !== after.time && after.time) diffs.push(`時間→${after.time}`);
   if (before.passengers !== after.passengers && after.passengers) diffs.push(`人數→${after.passengers}`);
   return diffs.join("，");
+}
+
+function activeOrderUpdateBlockedByDecision(ai) {
+  const intent = String(ai?.decision?.intent ?? "").trim();
+  const action = String(ai?.decision?.action ?? "").trim();
+  const blockedIntents = new Set([
+    "chitchat",
+    "status_inquiry",
+    "status_reply",
+    "quote_request",
+    "cancel_request"
+  ]);
+  const blockedActions = new Set([
+    "status_reply",
+    "quote_only",
+    "cancel_candidate",
+    "hold_for_confirmation",
+    "escalate_to_human",
+    "ignore"
+  ]);
+  return blockedIntents.has(intent) || blockedActions.has(action);
+}
+
+function hasActiveOrderMaterialUpdateFromAi(ai, orderBefore) {
+  if (!ai || activeOrderUpdateBlockedByDecision(ai)) return false;
+  const draft = ai.draft && typeof ai.draft === "object" ? ai.draft : {};
+  const fields = ["pickup", "dropoff", "time", "passengers"];
+  for (const field of fields) {
+    const next = String(draft[field] ?? "").trim();
+    if (!next) continue;
+    const before = String(orderBefore?.[field] ?? "").trim();
+    if (next !== before) return true;
+  }
+  return false;
 }
 
 function setUserState(userId, state, data = {}) {
