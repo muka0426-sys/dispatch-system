@@ -1838,9 +1838,20 @@ function isQuoteAbandonText(text) {
   return p === "算了" || p === "先算了";
 }
 
+function isQuoteGenericFareFormulaText(fareText) {
+  const s = String(fareText ?? "").trim();
+  if (!s) return false;
+  if (/(最短|參考里程|預估里程)\s*[\d.]+km/.test(s)) return false;
+  if (/起步\s*\$50/.test(s)) return true;
+  if (/\$20\/公里/.test(s)) return true;
+  if (/4公里內低消/.test(s)) return true;
+  return false;
+}
+
 function isQuoteDisplayFlatOrExplicitFareText(fareText) {
   const s = String(fareText ?? "").trim();
   if (!s) return false;
+  if (isQuoteGenericFareFormulaText(s)) return false;
   if (/機場定額|內建路線定額/.test(s)) return true;
   if (/定額\s*\$?\d+/.test(s)) return true;
   if (/(最短|參考里程|預估里程)\s*[\d.]+km/.test(s) && /\$\d+/.test(s)) return true;
@@ -1861,25 +1872,24 @@ function extractQuoteFareSuffixNotes(fareText) {
 
 async function buildQuoteFareTextForDisplay(ai, merged) {
   const original = String(merged?.estimated_fare_text ?? "").trim();
-  if (isQuoteDisplayFlatOrExplicitFareText(original)) {
-    return original;
-  }
-
   const suffix = extractQuoteFareSuffixNotes(original);
-  const price = ai?.price == null ? null : Number(ai.price);
-  if (Number.isFinite(price) && price > 0) {
-    return `約 $${Math.round(price)}${suffix}`;
-  }
-
   const pickup = String(merged?.pickup ?? "").trim();
   const dropoff = String(merged?.dropoff ?? "").trim();
+
   if (pickup && dropoff) {
     const est = await getGoogleShortestRouteEstimate({ origin: pickup, destination: dropoff });
     if (est?.km) {
-      const billedKm = Math.ceil(Number(est.km));
-      const fare = Math.max(130, 50 + 20 * billedKm);
-      return `參考里程 ${est.km}km，預估約 $${fare}${suffix}`;
+      return `參考里程 ${est.km}km，預估約 $${est.fare}${suffix}`;
     }
+  }
+
+  if (!isQuoteGenericFareFormulaText(original) && isQuoteDisplayFlatOrExplicitFareText(original)) {
+    return original;
+  }
+
+  const price = ai?.price == null ? null : Number(ai.price);
+  if (Number.isFinite(price) && price > 0) {
+    return `約 $${Math.round(price)}${suffix}`;
   }
 
   return original;
