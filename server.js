@@ -1843,7 +1843,7 @@ function isQuoteDisplayFlatOrExplicitFareText(fareText) {
   if (!s) return false;
   if (/機場定額|內建路線定額/.test(s)) return true;
   if (/定額\s*\$?\d+/.test(s)) return true;
-  if (/最短[\d.]+km/.test(s) && /\$\d+/.test(s)) return true;
+  if (/(最短|參考里程|預估里程)\s*[\d.]+km/.test(s) && /\$\d+/.test(s)) return true;
   if (/起步\$50＋\$20\/公里/.test(s)) return false;
   if (/\$\d+/.test(s)) return true;
   return false;
@@ -1878,7 +1878,7 @@ async function buildQuoteFareTextForDisplay(ai, merged) {
     if (est?.km) {
       const billedKm = Math.ceil(Number(est.km));
       const fare = Math.max(130, 50 + 20 * billedKm);
-      return `最短${est.km}km，預估約 $${fare}${suffix}`;
+      return `參考里程 ${est.km}km，預估約 $${fare}${suffix}`;
     }
   }
 

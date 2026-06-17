@@ -1082,7 +1082,7 @@ export async function parseOrderFromText(messageText, options = {}) {
                 if (est?.km) {
                   const calc = rsFareExpectedBy52(est.km);
                   if (Number.isFinite(calc)) {
-                    draft.estimated_fare_text = `最短${est.km}km 估$${calc}`;
+                    draft.estimated_fare_text = `參考里程 ${est.km}km 估$${calc}`;
                   }
                 } else {
                   const flatFallback = estimateAirportFlatFare(draft.pickup);
@@ -1406,7 +1406,7 @@ export function rsCheckOvercharge({ km, fare }) {
 }
 
 /**
- * v0.2.0 最短里程估價（Google Directions）
+ * v0.2.0 路線里程估價（Google Directions，取多條 route 中 distance 最小者）
  * 需要環境變數 GOOGLE_MAPS_API_KEY
  */
 export async function getGoogleShortestRouteEstimate({ origin, destination }) {
@@ -1421,6 +1421,7 @@ export async function getGoogleShortestRouteEstimate({ origin, destination }) {
     `?origin=${encodeURIComponent(o)}` +
     `&destination=${encodeURIComponent(d)}` +
     "&mode=driving&region=tw&language=zh-TW" +
+    "&alternatives=true" +
     `&key=${encodeURIComponent(key)}`;
 
   const controller = new AbortController();
@@ -1429,14 +1430,44 @@ export async function getGoogleShortestRouteEstimate({ origin, destination }) {
     const res = await fetch(url, { signal: controller.signal });
     if (!res.ok) return null;
     const data = await res.json();
-    const meters = data?.routes?.[0]?.legs?.[0]?.distance?.value;
-    const metersNum = Number(meters);
-    const est = rsFareBy52FromMeters(metersNum);
+    const routes = Array.isArray(data?.routes) ? data.routes : [];
+
+    let minMeters = null;
+    let selectedIndex = -1;
+    const routeKmList = [];
+
+    for (let i = 0; i < routes.length; i++) {
+      const meters = routes[i]?.legs?.[0]?.distance?.value;
+      const metersNum = Number(meters);
+      if (!Number.isFinite(metersNum) || metersNum <= 0) continue;
+      routeKmList.push(Number((metersNum / 1000).toFixed(1)));
+      if (minMeters == null || metersNum < minMeters) {
+        minMeters = metersNum;
+        selectedIndex = i;
+      }
+    }
+
+    if (minMeters == null) return null;
+
+    const est = rsFareBy52FromMeters(minMeters);
     if (!est?.fare) return null;
+
+    if (process.env.MAP_ROUTE_DEBUG === "1") {
+      console.log("[ROUTE_DEBUG] route estimate", {
+        routeCount: routes.length,
+        routeKmList,
+        selectedKm: est.km,
+        selectedIndex,
+        fare: est.fare
+      });
+    }
+
     return {
-      distance_meters: Math.round(metersNum),
+      distance_meters: Math.round(minMeters),
       km: est.km,
-      fare: est.fare
+      fare: est.fare,
+      selected_route_index: selectedIndex,
+      route_count: routes.length
     };
   } catch {
     return null;
