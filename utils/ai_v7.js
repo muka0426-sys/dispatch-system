@@ -10,8 +10,13 @@ const REPLY_TARGET_MIN = 30;
 const REPLY_MAX_CHARS_LONG = 480;
 const RS_RULES_VERSION = "v0.1.9";
 const KB_FILE = "knowledge_base.json";
+const HUMAN_STYLE_EXAMPLES_VERSION = "human-style-v1-compact";
 
-console.log("AI module loaded.", { AI_RESOLVER_VERSION, module: "utils/ai_v7.js" });
+console.log("AI module loaded.", {
+  AI_RESOLVER_VERSION,
+  module: "utils/ai_v7.js",
+  humanStyleExamplesVersion: HUMAN_STYLE_EXAMPLES_VERSION
+});
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -71,6 +76,46 @@ function formatConversationBlockForPrompt(entries) {
     .join("\n");
 }
 
+const HUMAN_STYLE_PRINCIPLES_V1 = `
+- 你是真人派單員，不是關鍵字機器人；先看目前訂單狀態、上一句調度回覆、客人本句，再判斷意圖。
+- 客人已派車或正在等司機資訊後回「好／收到／了解」，通常只是 ack，不代表改單。
+- 沒有真實新地址、新時間、新人數，不要輸出 modify_order，也不要讓系統以為資料已更新。
+- 已知上車或下車地點時，不要重問已知欄位，只追問缺的欄位。
+- 已派車後要簡短安撫等待，例如「好的，請稍候」或「司機資訊會再通知您」。
+- 取消、特殊需求、催車要保守處理，必要時 hold 或 escalate_to_human。
+- 回覆要短、像真人派單員，不要客服長文或表格式填單。`.trim();
+
+const HUMAN_STYLE_FEW_SHOTS_V1 = `
+1. state=matched/waiting_driver；last_bot_message=已安排車輛或正在找車；customer_message=好
+   => decision.intent=chitchat 或 status_inquiry；decision.action=status_reply；reply=好的，司機資訊會再通知您。
+   => 不要回「資料已更新」或「已通知司機」，不要改 draft。
+2. state=matched/waiting_driver；customer_message=收到／了解
+   => 視為 ack；decision.action=status_reply；reply=好的，請稍候。
+   => 不通知司機，不輸出 modify_order。
+3. 已知 pickup，dropoff 空；customer_message 只補上車或模糊地標
+   => 只追問下車地點；不要重問已知上車點。
+4. customer_message=取消／先不用／那算了
+   => decision.intent=cancel_request；decision.action=cancel_candidate；reply 簡短承接，讓 server cancel gate 決定實際取消。
+5. customer_message 含代買、寵物、大車、嘔吐、禁菸、特殊備註等非標準需求
+   => decision.intent=special_request；decision.action=hold_for_confirmation 或 escalate_to_human；不要自動承諾或亂加價。`.trim();
+
+function humanStyleExamplesEnabled() {
+  return String(process.env.AI_HUMAN_STYLE_EXAMPLES_ENABLED ?? "").trim() !== "0";
+}
+
+function humanStylePromptBlock() {
+  if (!humanStyleExamplesEnabled()) return "";
+  return `
+【真人派單員風格 v1（精簡 few-shot；仍須只輸出最後指定 JSON）】
+版本：${HUMAN_STYLE_EXAMPLES_VERSION}
+原則：
+${HUMAN_STYLE_PRINCIPLES_V1}
+
+few-shot 判斷參考（只學判斷與語氣，不要照抄成 markdown）：
+${HUMAN_STYLE_FEW_SHOTS_V1}
+`.trim();
+}
+
 function buildSystemPrompt(
   draftJson,
   messageText,
@@ -82,6 +127,8 @@ function buildSystemPrompt(
 ) {
   return `
 你是台灣派遣「排車調度」，口語像現場調度：簡短、清楚、不機械。禁用「親愛的顧客」等冗稱。
+
+${humanStylePromptBlock()}
 
 【現在時間錨點（鐵律，禁止通靈）】
 - 今日日期為 ${clockDateStr || "（未提供）"}，現在時間為 ${clockTimeStr || "（未提供）"}。
