@@ -616,6 +616,7 @@ async function handleEvent(event) {
           cancelProbe.includes("不叫了") ||
           cancelProbe.includes("不用了") ||
           cancelProbe.includes("那算了") ||
+          cancelProbe.includes("算了") ||
           cancelProbe.includes("先不用") ||
           cancelProbe.includes("不坐了") ||
           cancelProbe === "取消" ||
@@ -772,6 +773,12 @@ async function handleEvent(event) {
         return;
       }
       // ===== end Status inquiry gate =====
+
+      // ===== Pure ack gate P0：純收到不打 AI、不改單、不通知司機 =====
+      if (detectPureCustomerAck(text)) {
+        return;
+      }
+      // ===== end Pure ack gate =====
 
       // v0.3.2：修改時間意圖 → 清除舊 alarm，更新 rideTimestamp 後重設 alarm
       // v0.7.20：客人未給新時間時不追問，草稿時間預設為現在；已媒合改時間改推司機主群。
@@ -1719,6 +1726,12 @@ function normalizeStatusInquiryProbe(text) {
     .replace(/[，。！？、,.!?；;：:「」『』（）()【】\[\]《》<>／\/\\\-＿_~～…·•]/g, "");
 }
 
+function detectPureCustomerAck(text) {
+  const p = normalizeStatusInquiryProbe(text);
+  if (!p) return false;
+  return new Set(["好", "好的", "收到", "ok", "了解", "嗯"]).has(p);
+}
+
 function checkServiceAreaGate({ text, pickup, dropoff }) {
   const combined = [pickup, dropoff, text].filter(Boolean).join(" ");
 
@@ -1788,6 +1801,13 @@ function detectStatusInquiry(text) {
     p === "到了嗎" ||
     p === "司機到了嗎" ||
     p === "車到了嗎" ||
+    p === "司機多久到" ||
+    p === "多久到" ||
+    p === "好多久到" ||
+    p === "車牌是什麼" ||
+    p === "車牌" ||
+    p === "司機資訊再給我一次" ||
+    p === "司機資訊" ||
     p === "還在找嗎" ||
     p === "找到了嗎"
   );
