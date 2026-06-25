@@ -786,6 +786,14 @@ async function handleEvent(event) {
 
       // ===== Status inquiry gate P0-A-002：狀態追問不是新單 =====
       const isDriverInfoInquiry = detectDriverInfoInquiry(text);
+      const driverInfoProbe = normalizeStatusInquiryProbe(text);
+      if (isDriverInfoInquiry || driverInfoProbe === "車") {
+        p1cDebug("driver_info_inquiry_probe", {
+          probe: driverInfoProbe,
+          hit: isDriverInfoInquiry,
+          userId
+        });
+      }
       if (isDriverInfoInquiry || detectStatusInquiry(text)) {
         const statusMsg = isDriverInfoInquiry
           ? buildDriverInfoInquiryReply(userId)
@@ -1445,6 +1453,14 @@ function getDriverDisplayName(driverUserId) {
   return "司機夥伴";
 }
 
+function p1cDebug(event, data = {}) {
+  try {
+    console.log("[P1C_DEBUG]", event, JSON.stringify(data));
+  } catch (e) {
+    console.log("[P1C_DEBUG]", event, data);
+  }
+}
+
 /** LINE textV2 substitution：`{` `}` 需跳脫為 `{{` `}}`。 */
 function escapeLineTextV2Substitution(s) {
   return String(s ?? "")
@@ -1518,9 +1534,29 @@ async function notifyCustomerDriverMatched(customerId, driverUserId, driverEta) 
 
 async function notifyCustomerDriverMatchedWithCard(customerId, driverUserId, driverEta) {
   const cardText = String(getDriverCardText(driverUserId) ?? "").trim();
+  const hasValidCard = Boolean(cardText && cardText !== "（尚未設定車卡）");
+  p1cDebug("customer_push_before", {
+    willPushCustomer: true,
+    customerId,
+    driverUserId,
+    hasValidCard,
+    cardTextLength: cardText.length
+  });
   if (cardText && cardText !== "（尚未設定車卡）") {
-    await notifyCustomerDriverMatched(customerId, driverUserId, driverEta);
-    await pushText(customerId, cardText);
+    try {
+      await notifyCustomerDriverMatched(customerId, driverUserId, driverEta);
+      p1cDebug("customer_push_arrange_success", { customerId, driverUserId });
+    } catch (e) {
+      p1cDebug("customer_push_arrange_fail", { customerId, driverUserId, error: e?.message || String(e) });
+      throw e;
+    }
+    try {
+      await pushText(customerId, cardText);
+      p1cDebug("customer_push_card_success", { customerId, driverUserId, cardTextLength: cardText.length });
+    } catch (e) {
+      p1cDebug("customer_push_card_fail", { customerId, driverUserId, error: e?.message || String(e) });
+      throw e;
+    }
     return;
   }
 
@@ -1531,7 +1567,13 @@ async function notifyCustomerDriverMatchedWithCard(customerId, driverUserId, dri
       ? `約 ${eta} 分鐘抵達`
       : `約 ${eta} 抵達`
     : "已接單，將依約定時間前往";
-  await pushText(customerId, `已為您安排司機：${name}，${etaPhrase}，車卡資訊目前尚未設定。`);
+  try {
+    await pushText(customerId, `已為您安排司機：${name}，${etaPhrase}，車卡資訊目前尚未設定。`);
+    p1cDebug("customer_push_fallback_success", { customerId, driverUserId });
+  } catch (e) {
+    p1cDebug("customer_push_fallback_fail", { customerId, driverUserId, error: e?.message || String(e) });
+    throw e;
+  }
 }
 
 async function appendLogicErrorLog({
@@ -2280,12 +2322,36 @@ function lastBidCreatedAtMs(order) {
   return max > 0 ? max : null;
 }
 
+function p1cWaitingOrderCandidateSummary(order, textTokens = []) {
+  const orderTokens = extractLocationTokensForBidMatch(
+    `${String(order?.pickup ?? "")}${String(order?.dropoff ?? "")}${String(order?.address ?? "")}`
+  ).slice(0, 4);
+  return {
+    orderId: order?.orderId ?? null,
+    customerId: order?.customerId ?? null,
+    status: order?.status ?? null,
+    lastBidCreatedAtMs: lastBidCreatedAtMs(order),
+    tokenSummary: orderTokens,
+    matchesTextTokens: textTokens.length ? orderMatchesLocationTokens(order, textTokens) : null
+  };
+}
+
 /**
  * 司機群：@ 標記 → 優先綁「最近有人喊單」的 waiting；地名比對 → 優先消化最舊 waiting。
  */
 function getWaitingOrderForDriverMessage(text, { isDispatcherMark }) {
   const waiting = waitingOrdersToday().sort((a, b) => b.createdAt - a.createdAt);
-  if (!waiting.length) return null;
+  const tokens = extractLocationTokensForBidMatch(text);
+  p1cDebug("waiting_order_candidates", {
+    isDispatcherMark: Boolean(isDispatcherMark),
+    waitingCount: waiting.length,
+    textTokens: tokens,
+    candidates: waiting.map((o) => p1cWaitingOrderCandidateSummary(o, tokens))
+  });
+  if (!waiting.length) {
+    p1cDebug("waiting_order_selected", { selected: null, reason: "no_waiting_orders" });
+    return null;
+  }
 
   if (isDispatcherMark) {
     const withBids = waiting.filter((o) => lastBidCreatedAtMs(o) != null);
@@ -2297,18 +2363,39 @@ function getWaitingOrderForDriverMessage(text, { isDispatcherMark }) {
         if (ga !== gb) return ga - gb;
         return a.createdAt - b.createdAt;
       });
+      p1cDebug("waiting_order_selected", {
+        reason: "dispatcher_mark_recent_bid",
+        selected: p1cWaitingOrderCandidateSummary(withBids[0], tokens)
+      });
       return withBids[0];
     }
+    p1cDebug("waiting_order_selected", {
+      reason: "dispatcher_mark_fallback_newest_waiting",
+      selected: p1cWaitingOrderCandidateSummary(waiting[0], tokens)
+    });
     return waiting[0];
   }
 
-  if (waiting.length === 1) return waiting[0];
-  const tokens = extractLocationTokensForBidMatch(text);
+  if (waiting.length === 1) {
+    p1cDebug("waiting_order_selected", {
+      reason: "single_waiting_order",
+      selected: p1cWaitingOrderCandidateSummary(waiting[0], tokens)
+    });
+    return waiting[0];
+  }
   const matched = waiting.filter((o) => orderMatchesLocationTokens(o, tokens));
   if (matched.length) {
     matched.sort((a, b) => a.createdAt - b.createdAt);
+    p1cDebug("waiting_order_selected", {
+      reason: "location_token_match_oldest",
+      selected: p1cWaitingOrderCandidateSummary(matched[0], tokens)
+    });
     return matched[0];
   }
+  p1cDebug("waiting_order_selected", {
+    reason: "fallback_newest_waiting",
+    selected: p1cWaitingOrderCandidateSummary(waiting[0], tokens)
+  });
   return waiting[0];
 }
 
@@ -2742,7 +2829,22 @@ async function tryReplyIdleDriverCheckinForAdminGroup(replyToken, userId, text) 
  * 司機 LINE 群與司機主群共用：Rs 喊單、車卡、到點、客下核對。
  * allowIdleCheckin：僅主群在無 waiting 單時，對地名+數字／準 發送報班回覆。
  */
-async function processDriverFleetGroupMessage(_event, replyToken, userId, text, { allowIdleCheckin }) {
+async function processDriverFleetGroupMessage(event, replyToken, userId, text, { allowIdleCheckin }) {
+  const groupId = event?.source?.groupId || "";
+  const sourceId = groupId || event?.source?.userId || "";
+  const entryBid = parseRsDriverBid(text);
+  const entryDispatcherMark = parseRsDispatcherMark(text);
+  p1cDebug("group_handler_enter", {
+    sourceId,
+    groupId,
+    userId,
+    text: String(text ?? "").slice(0, 160),
+    isDriverGroup: groupId === DRIVER_GROUP_ID,
+    isAdminGroup: Boolean(groupId && groupId === (process.env.ADMIN_GROUP_ID || "").trim()),
+    allowIdleCheckin: Boolean(allowIdleCheckin),
+    parseRsDriverBid: entryBid,
+    parseRsDispatcherMark: entryDispatcherMark
+  });
   if (orders.length === 0) {
     if (allowIdleCheckin && (await tryReplyIdleDriverCheckinForAdminGroup(replyToken, userId, text))) return;
     return;
@@ -2879,9 +2981,21 @@ async function processDriverFleetGroupMessage(_event, replyToken, userId, text, 
   };
 
   if (dispatcherMark) {
+    p1cDebug("branch_enter", {
+      branch: "dispatcher_mark",
+      orderId: waitingOrder.orderId,
+      customerId: waitingOrder.customerId,
+      beforeStatus: waitingOrder.status,
+      userId
+    });
     waitingOrder.rs.dispatcherMarkedAtMs = Date.now();
     const leader = pickRsLeadingBid({ timing: waitingOrder.rs.timing, bids: waitingOrder.rs.bids });
     if (!leader) {
+      p1cDebug("dispatcher_mark_no_leader", {
+        orderId: waitingOrder.orderId,
+        customerId: waitingOrder.customerId,
+        bidsCount: Array.isArray(waitingOrder.rs.bids) ? waitingOrder.rs.bids.length : 0
+      });
       await reply(replyToken, "目前沒有有效喊單，先喊單再標記喔。");
       return;
     }
@@ -2893,19 +3007,74 @@ async function processDriverFleetGroupMessage(_event, replyToken, userId, text, 
     waitingOrder.rs.assignedAtMs = Date.now();
     waitingOrder.rs.assignedDriverUserId = leader.driverUserId;
 
-    await notifyCustomerDriverMatched(
-      waitingOrder.customerId,
-      leader.driverUserId,
-      waitingOrder.driverEta
-    );
+    p1cDebug("dispatcher_mark_after_update", {
+      orderId: waitingOrder.orderId,
+      customerId: waitingOrder.customerId,
+      afterStatus: waitingOrder.status,
+      orderDriverUserId: waitingOrder.driverUserId,
+      orderDriverId: waitingOrder.driverId,
+      orderDriverEta: waitingOrder.driverEta
+    });
+    try {
+      await notifyCustomerDriverMatched(
+        waitingOrder.customerId,
+        leader.driverUserId,
+        waitingOrder.driverEta
+      );
+      p1cDebug("customer_push_arrange_success", {
+        branch: "dispatcher_mark",
+        customerId: waitingOrder.customerId,
+        driverUserId: leader.driverUserId
+      });
+    } catch (e) {
+      p1cDebug("customer_push_arrange_fail", {
+        branch: "dispatcher_mark",
+        customerId: waitingOrder.customerId,
+        driverUserId: leader.driverUserId,
+        error: e?.message || String(e)
+      });
+      throw e;
+    }
 
     const cardText = getDriverCardText(leader.driverUserId);
-    await pushText(waitingOrder.customerId, cardText);
+    p1cDebug("customer_push_card_before", {
+      branch: "dispatcher_mark",
+      willPushCustomer: true,
+      customerId: waitingOrder.customerId,
+      driverUserId: leader.driverUserId,
+      hasValidCard: Boolean(String(cardText ?? "").trim() && String(cardText ?? "").trim() !== "（尚未設定車卡）"),
+      cardTextLength: String(cardText ?? "").length
+    });
+    try {
+      await pushText(waitingOrder.customerId, cardText);
+      p1cDebug("customer_push_card_success", {
+        branch: "dispatcher_mark",
+        customerId: waitingOrder.customerId,
+        driverUserId: leader.driverUserId,
+        cardTextLength: String(cardText ?? "").length
+      });
+    } catch (e) {
+      p1cDebug("customer_push_card_fail", {
+        branch: "dispatcher_mark",
+        customerId: waitingOrder.customerId,
+        driverUserId: leader.driverUserId,
+        error: e?.message || String(e)
+      });
+      throw e;
+    }
     return;
   }
 
   const bid = parseRsDriverBid(text);
   if (bid.kind === "ready" || bid.kind === "minutes") {
+    p1cDebug("branch_enter", {
+      branch: "driver_bid",
+      orderId: waitingOrder.orderId,
+      customerId: waitingOrder.customerId,
+      beforeStatus: waitingOrder.status,
+      userId,
+      bid
+    });
     const validation = validateRsBid({ timing: waitingOrder.rs.timing, bid });
     if (!validation.ok) {
       await reply(replyToken, validation.reason);
@@ -2947,6 +3116,16 @@ async function processDriverFleetGroupMessage(_event, replyToken, userId, text, 
     if (leader && leader.driverUserId === userId) {
       const eta = leader.kind === "minutes" ? String(leader.minutes ?? "") : "準";
       pendingDriver[waitingOrder.orderId] = { userId, time: eta };
+      p1cDebug("leader_branch_before_update", {
+        branch: "leader",
+        orderId: waitingOrder.orderId,
+        customerId: waitingOrder.customerId,
+        beforeStatus: waitingOrder.status,
+        driverUserId: userId,
+        driverId: waitingOrder.driverId,
+        eta,
+        willSetMatched: waitingOrder.status === "waiting"
+      });
       if (waitingOrder.status !== "waiting") return;
 
       waitingOrder.status = "matched";
@@ -2956,11 +3135,30 @@ async function processDriverFleetGroupMessage(_event, replyToken, userId, text, 
       waitingOrder.rs.assignedAtMs = Date.now();
       waitingOrder.rs.assignedDriverUserId = userId;
 
+      p1cDebug("leader_branch_after_update", {
+        orderId: waitingOrder.orderId,
+        customerId: waitingOrder.customerId,
+        afterStatus: waitingOrder.status,
+        orderDriverUserId: waitingOrder.driverUserId,
+        orderDriverId: waitingOrder.driverId,
+        orderDriverEta: waitingOrder.driverEta,
+        willDeletePendingDriver: true
+      });
       await notifyCustomerDriverMatchedWithCard(waitingOrder.customerId, userId, eta);
       delete pendingDriver[waitingOrder.orderId];
+      p1cDebug("leader_branch_pending_deleted", {
+        orderId: waitingOrder.orderId,
+        hasPendingDriver: Boolean(pendingDriver[waitingOrder.orderId])
+      });
 
       // 老闆指示：直接噴司機個人車卡，不要回覆領先幾分的廢話
       const cardText = getDriverCardText(userId);
+      p1cDebug("group_reply_card_before", {
+        willReplyGroupCard: true,
+        hasReplyToken: Boolean(replyToken),
+        driverUserId: userId,
+        cardTextLength: String(cardText ?? "").length
+      });
       await reply(replyToken, cardText);
       return;
     }
@@ -2970,15 +3168,61 @@ async function processDriverFleetGroupMessage(_event, replyToken, userId, text, 
 
   const cardTargetOrder = getWaitingOrderByPendingDriver(userId);
   if (cardTargetOrder) {
+    p1cDebug("branch_enter", {
+      branch: "pending_driver_card",
+      orderId: cardTargetOrder.orderId,
+      customerId: cardTargetOrder.customerId,
+      beforeStatus: cardTargetOrder.status,
+      userId
+    });
     const pending = pendingDriver[cardTargetOrder.orderId];
     cardTargetOrder.status = "matched";
     cardTargetOrder.driverId = userId;
     cardTargetOrder.driverUserId = userId;
     cardTargetOrder.driverEta = pending.time;
 
-    await notifyCustomerDriverMatched(cardTargetOrder.customerId, userId, pending.time);
+    try {
+      await notifyCustomerDriverMatched(cardTargetOrder.customerId, userId, pending.time);
+      p1cDebug("customer_push_arrange_success", {
+        branch: "pending_driver_card",
+        customerId: cardTargetOrder.customerId,
+        driverUserId: userId
+      });
+    } catch (e) {
+      p1cDebug("customer_push_arrange_fail", {
+        branch: "pending_driver_card",
+        customerId: cardTargetOrder.customerId,
+        driverUserId: userId,
+        error: e?.message || String(e)
+      });
+      throw e;
+    }
 
-    await pushText(cardTargetOrder.customerId, text);
+    p1cDebug("customer_push_card_before", {
+      branch: "pending_driver_card",
+      willPushCustomer: true,
+      customerId: cardTargetOrder.customerId,
+      driverUserId: userId,
+      hasValidCard: Boolean(String(text ?? "").trim()),
+      cardTextLength: String(text ?? "").length
+    });
+    try {
+      await pushText(cardTargetOrder.customerId, text);
+      p1cDebug("customer_push_card_success", {
+        branch: "pending_driver_card",
+        customerId: cardTargetOrder.customerId,
+        driverUserId: userId,
+        cardTextLength: String(text ?? "").length
+      });
+    } catch (e) {
+      p1cDebug("customer_push_card_fail", {
+        branch: "pending_driver_card",
+        customerId: cardTargetOrder.customerId,
+        driverUserId: userId,
+        error: e?.message || String(e)
+      });
+      throw e;
+    }
     delete pendingDriver[cardTargetOrder.orderId];
 
     return;
