@@ -125,6 +125,26 @@
   - 6.0 km → 170
   - 6.1 km → 190
 
+### RC P0-A / P0-B ack-cancel-status stable point
+
+- branch: `release/rc-line-mvp-20260615`
+- latest remote commit: `ae00976 fix(rc): cancel directly before arrival and add rush status gate`
+- pushed to: `origin/release/rc-line-mvp-20260615`
+- status: **pushed and LINE-tested successfully**
+- P0-A verified:
+  - `好` / `收到` / `OK` / `好的` → pure ack silent.
+  - pure ack does not call Gemini, does not notify driver, and does not reply with data-updated wording.
+  - `好取消` / `不用了` / `算了` / `取消` → cancel gate.
+  - `司機多久到` / `車牌是什麼` → status gate.
+- P0-B verified:
+  - `waiting` / `matched` customer cancel → direct cancel before arrival.
+  - Vehicle not yet arrived, including 1-2 minutes away, can still be canceled.
+  - cancel reply: `好的，已幫您取消。`
+  - after cancel, `什麼司機資訊？` → `這筆已經取消。`
+  - after cancel, bot no longer replies with driver-info waiting text.
+  - `太久了` / `等太久` / `怎麼還沒到` → status/rush gate.
+  - rush/status gate does not call Gemini, does not notify driver, and does not modify quote / fare / route / pending quote / driver-group bid format.
+
 ## 3.5 Architecture / AI (document only)
 
 - **AI dispatcher role definition：** `AI_DISPATCHER_ROLE.md`
@@ -157,6 +177,13 @@
   4. 幫我叫
   5. OK
   6. 取消
+- RC P0-A / P0-B LINE test on `release/rc-line-mvp-20260615` passed:
+  1. 客人重新叫一單。
+  2. 客人回 `好` → bot silent.
+  3. 司機群回車卡。
+  4. 客人回 `太久了` → bot 回目前已安排司機；未打 Gemini.
+  5. 客人回 `取消` → bot 回 `好的，已幫您取消。`
+  6. 客人回 `什麼司機資訊？` → bot 回 `這筆已經取消。`
 
 ## 6. Data / training / Lobster / Hermes status
 
