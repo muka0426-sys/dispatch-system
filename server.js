@@ -323,6 +323,16 @@ function removeOrderById(orderId) {
   if (idx >= 0) orders.splice(idx, 1);
 }
 
+function getLatestCustomerOrder(customerId) {
+  const cid = String(customerId ?? "");
+  if (!cid) return null;
+  for (let i = orders.length - 1; i >= 0; i -= 1) {
+    const order = orders[i];
+    if (order.customerId === cid) return order;
+  }
+  return null;
+}
+
 async function deleteAlarmRecord(key) {
   if (!key) return;
   delete alarmsDb.alarms[key];
@@ -623,11 +633,11 @@ async function handleEvent(event) {
           cancelProbe.endsWith("取消");
 
         if (isExplicitCancel && !isCancelNegatedOrQuestion) {
-          const active = getActiveOrder(userId);
+          const active = getActiveOrder(userId) || getLatestCustomerOrder(userId);
           const status = String(active?.status ?? "").toLowerCase();
 
-          // 沒有進行中訂單，或已是終態：阻斷取消進 AI，清理客人端暫存
-          if (!active || status === "done" || status === "canceled") {
+          // 沒有任何訂單：阻斷取消進 AI，清理客人端暫存
+          if (!active) {
             clearDispatchDraft(userId);
             clearPendingDispatchConfirmation(userId);
             clearPendingSpecialRequest(userId);
@@ -637,21 +647,30 @@ async function handleEvent(event) {
             return;
           }
 
-          // waiting：尚未媒合司機，可直接取消並清掉實單
-          if (status === "waiting") {
-            clearAlarmByCustomer(userId);
-            deleteOrderByCustomer(userId);
+          if (status === "canceled" || status === "cancelled") {
+            await reply(replyToken, "這筆已經取消。");
+            return;
+          }
+
+          if (status === "done") {
+            await reply(replyToken, "這筆行程已完成，如需協助請由人工確認。");
+            return;
+          }
+
+          // waiting / matched：車還沒到，客人可直接取消。
+          if (status === "waiting" || status === "matched") {
+            await cancelActiveOrderDirectly(userId, active);
             clearDispatchDraft(userId);
             clearPendingDispatchConfirmation(userId);
             clearPendingSpecialRequest(userId);
             clearPendingQuoteConfirmation(userId);
             setUserState(userId, "idle", { conversationLog: [] });
-            await reply(replyToken, "已為您取消叫車");
+            await reply(replyToken, "好的，已幫您取消。");
             return;
           }
 
-          // 已媒合 / 已抵達 / 已上車：第一階段只攔截，不刪單、不改狀態
-          if (status === "matched" || status === "arrived" || status === "onboard") {
+          // 已抵達 / 已上車：先保守攔截，不刪單、不改狀態
+          if (status === "arrived" || status === "onboard") {
             clearPendingSpecialRequest(userId);
             clearPendingQuoteConfirmation(userId);
             await reply(
@@ -1382,6 +1401,17 @@ function clearAlarmByCustomer(customerId) {
   clearAlarm(order.orderId);
 }
 
+async function cancelActiveOrderDirectly(userId, order) {
+  if (!order) return;
+  clearAlarm(order.orderId);
+  order.status = "canceled";
+  order.canceledAtMs = Date.now();
+
+  if (hasDispatchCardSent(order) || orderDriverLineUserId(order)) {
+    await pushText(DRIVER_GROUP_ID, "此單客人已取消，請司機取消前往。");
+  }
+}
+
 function getDriverCardText(driverUserId) {
   const raw = (process.env.DRIVER_CARDS_JSON || "").trim();
   if (raw) {
@@ -1804,9 +1834,19 @@ function detectStatusInquiry(text) {
     p === "司機多久到" ||
     p === "多久到" ||
     p === "好多久到" ||
+    p === "太久了" ||
+    p === "等太久" ||
+    p === "等很久" ||
+    p === "太慢" ||
+    p === "怎麼還沒到" ||
+    p === "還沒到" ||
+    p === "司機怎麼還沒到" ||
+    p === "車怎麼還沒到" ||
+    p === "怎麼那麼久" ||
     p === "車牌是什麼" ||
     p === "車牌" ||
     p === "司機資訊再給我一次" ||
+    p === "什麼司機資訊" ||
     p === "司機資訊" ||
     p === "還在找嗎" ||
     p === "找到了嗎"
@@ -1823,6 +1863,11 @@ function hasMeaningfulDispatchDraft(userId) {
 function buildStatusInquiryReply(userId) {
   const active = getActiveOrder(userId);
   if (!active) {
+    const latest = getLatestCustomerOrder(userId);
+    const latestStatus = String(latest?.status ?? "").toLowerCase();
+    if (latestStatus === "canceled" || latestStatus === "cancelled") {
+      return "這筆已經取消。";
+    }
     if (hasMeaningfulDispatchDraft(userId)) {
       return "目前尚未正式派車，如需叫車請確認上車與下車地點。";
     }
