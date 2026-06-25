@@ -785,8 +785,11 @@ async function handleEvent(event) {
       }
 
       // ===== Status inquiry gate P0-A-002：狀態追問不是新單 =====
-      if (detectStatusInquiry(text)) {
-        const statusMsg = buildStatusInquiryReply(userId);
+      const isDriverInfoInquiry = detectDriverInfoInquiry(text);
+      if (isDriverInfoInquiry || detectStatusInquiry(text)) {
+        const statusMsg = isDriverInfoInquiry
+          ? buildDriverInfoInquiryReply(userId)
+          : buildStatusInquiryReply(userId);
         await reply(replyToken, statusMsg);
         appendConversationTurn(userId, "assistant", statusMsg);
         return;
@@ -1762,6 +1765,22 @@ function detectPureCustomerAck(text) {
   return new Set(["好", "好的", "收到", "ok", "了解", "嗯"]).has(p);
 }
 
+function detectDriverInfoInquiry(text) {
+  const p = normalizeStatusInquiryProbe(text);
+  if (!p) return false;
+  return new Set([
+    "車牌是什麼",
+    "車牌",
+    "司機資訊",
+    "司機資訊再給我一次",
+    "什麼司機資訊",
+    "司機是誰",
+    "車子資訊",
+    "車型",
+    "車號"
+  ]).has(p);
+}
+
 function checkServiceAreaGate({ text, pickup, dropoff }) {
   const combined = [pickup, dropoff, text].filter(Boolean).join(" ");
 
@@ -1888,6 +1907,39 @@ function buildStatusInquiryReply(userId) {
     return "目前這筆行程已進入上車或完成狀態。";
   }
   return "目前沒有進行中的叫車，如需叫車請提供上車與下車地點。";
+}
+
+function buildDriverInfoInquiryReply(userId) {
+  const active = getActiveOrder(userId);
+  if (!active) {
+    const latest = getLatestCustomerOrder(userId);
+    const latestStatus = String(latest?.status ?? "").toLowerCase();
+    if (latestStatus === "canceled" || latestStatus === "cancelled") {
+      return "這筆已經取消。";
+    }
+    return buildStatusInquiryReply(userId);
+  }
+
+  const status = String(active.status ?? "").toLowerCase();
+  if (status === "waiting") {
+    return "目前還在為您安排車輛，司機資訊會在配車後通知您。";
+  }
+
+  if (status === "matched" || status === "arrived") {
+    const driverUserId = orderDriverLineUserId(active);
+    if (!driverUserId) {
+      return "目前已為您安排車輛，司機資訊會再通知您。";
+    }
+
+    const cardText = String(getDriverCardText(driverUserId) ?? "").trim();
+    if (cardText && cardText !== "（尚未設定車卡）") {
+      return `司機資訊如下：\n${cardText}`;
+    }
+
+    return `已為您安排司機：${getDriverDisplayName(driverUserId)}，車卡資訊目前尚未設定。`;
+  }
+
+  return buildStatusInquiryReply(userId);
 }
 
 function detectSpecialServiceRequest(text, merged) {
