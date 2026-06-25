@@ -2255,6 +2255,38 @@ function waitingOrdersToday() {
   );
 }
 
+const RECENT_WAITING_ORDER_WINDOW_MS = 30 * 60_000;
+
+function waitingOrdersAll() {
+  return orders.filter((order) => String(order?.status ?? "").toLowerCase() === "waiting");
+}
+
+function p1cOrderRecentTimeMs(order) {
+  const candidates = [
+    order?.dispatchCardSentAtMs,
+    order?.dispatchedAtMs,
+    order?.createdAtMs,
+    order?.createdAt,
+    order?.rs?.dispatchedAtMs,
+    order?.rs?.createdAtMs
+  ];
+  let latest = null;
+  for (const value of candidates) {
+    const n = Number(value);
+    if (Number.isFinite(n) && n > 0 && (latest == null || n > latest)) latest = n;
+  }
+  return latest;
+}
+
+function recentWaitingOrders(nowMs = Date.now()) {
+  return waitingOrdersAll().filter((order) => {
+    const t = p1cOrderRecentTimeMs(order);
+    if (t == null) return false;
+    const ageMs = nowMs - t;
+    return ageMs >= 0 && ageMs <= RECENT_WAITING_ORDER_WINDOW_MS;
+  });
+}
+
 function normalizeTripKey(s) {
   return String(s ?? "")
     .replace(/\s+/g, "")
@@ -2311,6 +2343,13 @@ function orderMatchesLocationTokens(order, tokens) {
   return tokens.some((tok) => hay.includes(tok));
 }
 
+function orderLocationTokenScore(order, tokens) {
+  if (!tokens.length) return 0;
+  const hay = `${order.pickup || ""}${order.dropoff || ""}${order.address || ""}`;
+  const uniq = [...new Set(tokens.map((t) => String(t ?? "").trim()).filter(Boolean))];
+  return uniq.reduce((score, tok) => score + (hay.includes(tok) ? 1 : 0), 0);
+}
+
 function lastBidCreatedAtMs(order) {
   const bids = order?.rs?.bids;
   if (!Array.isArray(bids) || !bids.length) return null;
@@ -2322,81 +2361,131 @@ function lastBidCreatedAtMs(order) {
   return max > 0 ? max : null;
 }
 
-function p1cWaitingOrderCandidateSummary(order, textTokens = []) {
+function p1cWaitingOrderCandidateSummary(order, textTokens = [], source = "today", nowMs = Date.now()) {
   const orderTokens = extractLocationTokensForBidMatch(
     `${String(order?.pickup ?? "")}${String(order?.dropoff ?? "")}${String(order?.address ?? "")}`
   ).slice(0, 4);
+  const recentTimeMs = p1cOrderRecentTimeMs(order);
   return {
+    source,
     orderId: order?.orderId ?? null,
     customerId: order?.customerId ?? null,
     status: order?.status ?? null,
+    bookingDate: orderBookingYmd(order),
+    ageMs: recentTimeMs == null ? null : nowMs - recentTimeMs,
+    recentTimeMs,
     lastBidCreatedAtMs: lastBidCreatedAtMs(order),
     tokenSummary: orderTokens,
+    tokenScore: orderLocationTokenScore(order, textTokens),
     matchesTextTokens: textTokens.length ? orderMatchesLocationTokens(order, textTokens) : null
   };
+}
+
+function selectBestTokenMatchedWaitingOrder(candidates, tokens) {
+  if (!tokens.length || !candidates.length) return null;
+  const ranked = candidates
+    .map((order) => ({
+      order,
+      tokenScore: orderLocationTokenScore(order, tokens),
+      recentTimeMs: p1cOrderRecentTimeMs(order) ?? 0,
+      createdAt: Number(order?.createdAt ?? 0) || 0
+    }))
+    .filter((item) => item.tokenScore > 0)
+    .sort(
+      (a, b) =>
+        b.tokenScore - a.tokenScore ||
+        b.recentTimeMs - a.recentTimeMs ||
+        b.createdAt - a.createdAt
+    );
+  if (!ranked.length) return null;
+  const top = ranked[0];
+  const second = ranked[1];
+  if (
+    second &&
+    second.tokenScore === top.tokenScore &&
+    second.recentTimeMs === top.recentTimeMs &&
+    second.createdAt === top.createdAt
+  ) {
+    return { order: null, ambiguous: true };
+  }
+  return { order: top.order, ambiguous: false };
 }
 
 /**
  * 司機群：@ 標記 → 優先綁「最近有人喊單」的 waiting；地名比對 → 優先消化最舊 waiting。
  */
 function getWaitingOrderForDriverMessage(text, { isDispatcherMark }) {
-  const waiting = waitingOrdersToday().sort((a, b) => b.createdAt - a.createdAt);
+  const nowMs = Date.now();
+  const todayWaiting = waitingOrdersToday().sort((a, b) => b.createdAt - a.createdAt);
+  const recentWaiting = recentWaitingOrders(nowMs).sort(
+    (a, b) =>
+      (p1cOrderRecentTimeMs(b) ?? 0) - (p1cOrderRecentTimeMs(a) ?? 0) ||
+      (Number(b?.createdAt ?? 0) || 0) - (Number(a?.createdAt ?? 0) || 0)
+  );
+  const allWaiting = waitingOrdersAll();
   const tokens = extractLocationTokensForBidMatch(text);
+  const todayTokenPick = selectBestTokenMatchedWaitingOrder(todayWaiting, tokens);
+  const recentTokenPick = selectBestTokenMatchedWaitingOrder(recentWaiting, tokens);
+  const fallbackReason = !todayWaiting.length
+    ? "no_today_waiting"
+    : !todayTokenPick?.order
+      ? "today_no_token_match"
+      : null;
+  const usedFallback = Boolean(fallbackReason);
   p1cDebug("waiting_order_candidates", {
     isDispatcherMark: Boolean(isDispatcherMark),
-    waitingCount: waiting.length,
+    waitingCount: todayWaiting.length,
+    todayWaitingCount: todayWaiting.length,
+    recentWaitingCount: recentWaiting.length,
+    allWaitingCount: allWaiting.length,
+    usedFallback,
+    fallbackReason,
     textTokens: tokens,
-    candidates: waiting.map((o) => p1cWaitingOrderCandidateSummary(o, tokens))
+    candidates: [
+      ...todayWaiting.map((o) => p1cWaitingOrderCandidateSummary(o, tokens, "today", nowMs)),
+      ...recentWaiting
+        .filter((recent) => !todayWaiting.some((today) => today.orderId === recent.orderId))
+        .map((o) => p1cWaitingOrderCandidateSummary(o, tokens, "recent", nowMs))
+    ]
   });
-  if (!waiting.length) {
-    p1cDebug("waiting_order_selected", { selected: null, reason: "no_waiting_orders" });
-    return null;
+
+  if (todayTokenPick?.order) {
+    p1cDebug("waiting_order_selected", {
+      source: "today",
+      reason: "today_token_match",
+      selected: p1cWaitingOrderCandidateSummary(todayTokenPick.order, tokens, "today", nowMs)
+    });
+    return todayTokenPick.order;
   }
 
-  if (isDispatcherMark) {
-    const withBids = waiting.filter((o) => lastBidCreatedAtMs(o) != null);
-    if (withBids.length) {
-      const now = Date.now();
-      withBids.sort((a, b) => {
-        const ga = now - lastBidCreatedAtMs(a);
-        const gb = now - lastBidCreatedAtMs(b);
-        if (ga !== gb) return ga - gb;
-        return a.createdAt - b.createdAt;
-      });
-      p1cDebug("waiting_order_selected", {
-        reason: "dispatcher_mark_recent_bid",
-        selected: p1cWaitingOrderCandidateSummary(withBids[0], tokens)
-      });
-      return withBids[0];
-    }
+  if (recentTokenPick?.order) {
     p1cDebug("waiting_order_selected", {
-      reason: "dispatcher_mark_fallback_newest_waiting",
-      selected: p1cWaitingOrderCandidateSummary(waiting[0], tokens)
+      source: "recent_fallback",
+      reason: "recent_token_match",
+      selected: p1cWaitingOrderCandidateSummary(recentTokenPick.order, tokens, "recent", nowMs)
     });
-    return waiting[0];
+    return recentTokenPick.order;
   }
 
-  if (waiting.length === 1) {
+  if (!tokens.length && recentWaiting.length === 1) {
     p1cDebug("waiting_order_selected", {
-      reason: "single_waiting_order",
-      selected: p1cWaitingOrderCandidateSummary(waiting[0], tokens)
+      source: "recent_fallback",
+      reason: "only_recent_waiting",
+      selected: p1cWaitingOrderCandidateSummary(recentWaiting[0], tokens, "recent", nowMs)
     });
-    return waiting[0];
+    return recentWaiting[0];
   }
-  const matched = waiting.filter((o) => orderMatchesLocationTokens(o, tokens));
-  if (matched.length) {
-    matched.sort((a, b) => a.createdAt - b.createdAt);
-    p1cDebug("waiting_order_selected", {
-      reason: "location_token_match_oldest",
-      selected: p1cWaitingOrderCandidateSummary(matched[0], tokens)
-    });
-    return matched[0];
-  }
+
+  const noSelectionReason =
+    recentWaiting.length > 1
+      ? "ambiguous_recent_waiting_orders"
+      : "no_waiting_orders";
   p1cDebug("waiting_order_selected", {
-    reason: "fallback_newest_waiting",
-    selected: p1cWaitingOrderCandidateSummary(waiting[0], tokens)
+    source: "none",
+    reason: noSelectionReason,
+    selected: null
   });
-  return waiting[0];
+  return null;
 }
 
 function getWaitingOrderByPendingDriver(driverUserId) {
