@@ -1516,6 +1516,24 @@ async function notifyCustomerDriverMatched(customerId, driverUserId, driverEta) 
   await pushText(customerId, msg);
 }
 
+async function notifyCustomerDriverMatchedWithCard(customerId, driverUserId, driverEta) {
+  const cardText = String(getDriverCardText(driverUserId) ?? "").trim();
+  if (cardText && cardText !== "（尚未設定車卡）") {
+    await notifyCustomerDriverMatched(customerId, driverUserId, driverEta);
+    await pushText(customerId, cardText);
+    return;
+  }
+
+  const name = getDriverDisplayName(driverUserId);
+  const eta = String(driverEta ?? "").trim();
+  const etaPhrase = eta && eta !== "準"
+    ? /^\d+$/.test(eta)
+      ? `約 ${eta} 分鐘抵達`
+      : `約 ${eta} 抵達`
+    : "已接單，將依約定時間前往";
+  await pushText(customerId, `已為您安排司機：${name}，${etaPhrase}，車卡資訊目前尚未設定。`);
+}
+
 async function appendLogicErrorLog({
   title,
   driverUserId,
@@ -2929,6 +2947,18 @@ async function processDriverFleetGroupMessage(_event, replyToken, userId, text, 
     if (leader && leader.driverUserId === userId) {
       const eta = leader.kind === "minutes" ? String(leader.minutes ?? "") : "準";
       pendingDriver[waitingOrder.orderId] = { userId, time: eta };
+      if (waitingOrder.status !== "waiting") return;
+
+      waitingOrder.status = "matched";
+      waitingOrder.driverId = userId;
+      waitingOrder.driverUserId = userId;
+      waitingOrder.driverEta = eta;
+      waitingOrder.rs.assignedAtMs = Date.now();
+      waitingOrder.rs.assignedDriverUserId = userId;
+
+      await notifyCustomerDriverMatchedWithCard(waitingOrder.customerId, userId, eta);
+      delete pendingDriver[waitingOrder.orderId];
+
       // 老闆指示：直接噴司機個人車卡，不要回覆領先幾分的廢話
       const cardText = getDriverCardText(userId);
       await reply(replyToken, cardText);
