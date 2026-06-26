@@ -1532,9 +1532,14 @@ async function notifyCustomerDriverMatched(customerId, driverUserId, driverEta) 
   await pushText(customerId, msg);
 }
 
+function isValidDriverCardText(cardText) {
+  const t = String(cardText ?? "").trim();
+  return Boolean(t && !t.includes("尚未設定車卡"));
+}
+
 async function notifyCustomerDriverMatchedWithCard(customerId, driverUserId, driverEta) {
   const cardText = String(getDriverCardText(driverUserId) ?? "").trim();
-  const hasValidCard = Boolean(cardText && cardText !== "（尚未設定車卡）");
+  const hasValidCard = isValidDriverCardText(cardText);
   p1cDebug("customer_push_before", {
     willPushCustomer: true,
     customerId,
@@ -1542,7 +1547,7 @@ async function notifyCustomerDriverMatchedWithCard(customerId, driverUserId, dri
     hasValidCard,
     cardTextLength: cardText.length
   });
-  if (cardText && cardText !== "（尚未設定車卡）") {
+  if (hasValidCard) {
     try {
       await notifyCustomerDriverMatched(customerId, driverUserId, driverEta);
       p1cDebug("customer_push_arrange_success", { customerId, driverUserId });
@@ -3204,6 +3209,8 @@ async function processDriverFleetGroupMessage(event, replyToken, userId, text, {
 
     if (leader && leader.driverUserId === userId) {
       const eta = leader.kind === "minutes" ? String(leader.minutes ?? "") : "準";
+      const cardText = String(getDriverCardText(userId) ?? "").trim();
+      const hasValidCard = isValidDriverCardText(cardText);
       pendingDriver[waitingOrder.orderId] = { userId, time: eta };
       p1cDebug("leader_branch_before_update", {
         branch: "leader",
@@ -3213,9 +3220,43 @@ async function processDriverFleetGroupMessage(event, replyToken, userId, text, {
         driverUserId: userId,
         driverId: waitingOrder.driverId,
         eta,
+        hasValidCard,
         willSetMatched: waitingOrder.status === "waiting"
       });
       if (waitingOrder.status !== "waiting") return;
+
+      if (!hasValidCard) {
+        p1cDebug("leader_no_card_pending", {
+          branch: "leader_no_card_pending",
+          orderId: waitingOrder.orderId,
+          customerId: waitingOrder.customerId,
+          driverUserId: userId,
+          eta,
+          hasValidCard: false,
+          willFinalizeMatched: false,
+          willPushCustomer: false,
+          willDeletePendingDriver: false,
+          pendingDriverSet: Boolean(pendingDriver[waitingOrder.orderId]),
+          orderStatusAfter: waitingOrder.status
+        });
+        const pendingMsg = eta === "準"
+          ? "已記錄司機準，請貼車卡。"
+          : `已記錄司機約 ${eta} 分鐘，請貼車卡。`;
+        await reply(replyToken, pendingMsg);
+        return;
+      }
+
+      p1cDebug("leader_has_card", {
+        branch: "leader_has_card",
+        orderId: waitingOrder.orderId,
+        customerId: waitingOrder.customerId,
+        driverUserId: userId,
+        eta,
+        hasValidCard: true,
+        willFinalizeMatched: true,
+        willPushCustomer: true,
+        willDeletePendingDriver: true
+      });
 
       waitingOrder.status = "matched";
       waitingOrder.driverId = userId;
@@ -3241,7 +3282,6 @@ async function processDriverFleetGroupMessage(event, replyToken, userId, text, {
       });
 
       // 老闆指示：直接噴司機個人車卡，不要回覆領先幾分的廢話
-      const cardText = getDriverCardText(userId);
       p1cDebug("group_reply_card_before", {
         willReplyGroupCard: true,
         hasReplyToken: Boolean(replyToken),
@@ -3262,7 +3302,9 @@ async function processDriverFleetGroupMessage(event, replyToken, userId, text, {
       orderId: cardTargetOrder.orderId,
       customerId: cardTargetOrder.customerId,
       beforeStatus: cardTargetOrder.status,
-      userId
+      userId,
+      driverUserId: userId,
+      willFinalizeMatched: true
     });
     const pending = pendingDriver[cardTargetOrder.orderId];
     cardTargetOrder.status = "matched";
