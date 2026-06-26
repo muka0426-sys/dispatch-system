@@ -145,6 +145,43 @@
   - `太久了` / `等太久` / `怎麼還沒到` → status/rush gate.
   - rush/status gate does not call Gemini, does not notify driver, and does not modify quote / fare / route / pending quote / driver-group bid format.
 
+### P1-D/E/F stable: driver bid waiting fallback + no-card pending + prioritized pending card
+
+- branch: `release/rc-line-mvp-20260615`
+- status: **LINE-tested successfully**
+- verified fixes:
+  1. **P1-D waiting order fallback**
+     - Driver bid can select the correct waiting order even when `todayWaitingCount` is 0.
+     - Verified selected order example: `RS0001`.
+     - Verified selected source/reason: `recent_fallback` + `recent_token_match`, or `today` + `today_token_match`.
+  2. **P1-E no-card pendingDriver retention**
+     - When no valid driver card exists, driver bid enters `leader_no_card_pending`.
+     - It does **not** mark the order `matched`.
+     - It does **not** push customer fallback driver-card text.
+     - It does **not** delete `pendingDriver`.
+     - Verified log fields: `pendingDriverSet:true`, `orderStatusAfter:waiting`.
+     - Verified group reply: `已記錄司機約 10 分鐘，請貼車卡`.
+  3. **P1-F pending_driver_card priority**
+     - When the driver posts the card after pendingDriver is set, the message enters `pending_driver_card` before token matching.
+     - Verified log fields: `willFinalizeMatched:true`, `willPushCustomer:true`, `willDeletePendingDriver:true`.
+     - Verified customer push logs: `customer_push_arrange_success`, `customer_push_card_success`.
+     - Customer received both the driver-arranged message and driver card.
+- key success log markers:
+  - `waiting_order_selected`
+  - `leader_no_card_pending`
+  - `pending_driver_card`
+  - `customer_push_arrange_success`
+  - `customer_push_card_success`
+- regression rules:
+  - No valid card → must **not** set `matched`.
+  - No valid card → must **not** push customer driver-card fallback.
+  - No valid card → must **not** delete `pendingDriver`.
+  - If `pendingDriver` exists when a card is posted, the message must enter `pending_driver_card` before token matching.
+- follow-up risks / not included in this stable point:
+  - The live test may have used the same LINE account for the test driver and driver identity; a formal multi-driver scenario still needs one conservative verification.
+  - Driver-info keywords such as `車？` / `車牌呢` are a separate follow-up task and must not be mixed into this stable point.
+  - Gemini 503 fallback and garbled text issues are separate follow-up tasks.
+
 ## 3.5 Architecture / AI (document only)
 
 - **AI dispatcher role definition：** `AI_DISPATCHER_ROLE.md`
