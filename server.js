@@ -3056,6 +3056,72 @@ async function processDriverFleetGroupMessage(event, replyToken, userId, text, {
     return;
   }
 
+  const cardTargetOrder = getWaitingOrderByPendingDriver(userId);
+  if (cardTargetOrder) {
+    p1cDebug("branch_enter", {
+      branch: "pending_driver_card",
+      orderId: cardTargetOrder.orderId,
+      customerId: cardTargetOrder.customerId,
+      beforeStatus: cardTargetOrder.status,
+      userId,
+      driverUserId: userId,
+      willFinalizeMatched: true,
+      willPushCustomer: true,
+      willDeletePendingDriver: true
+    });
+    const pending = pendingDriver[cardTargetOrder.orderId];
+    cardTargetOrder.status = "matched";
+    cardTargetOrder.driverId = userId;
+    cardTargetOrder.driverUserId = userId;
+    cardTargetOrder.driverEta = pending.time;
+
+    try {
+      await notifyCustomerDriverMatched(cardTargetOrder.customerId, userId, pending.time);
+      p1cDebug("customer_push_arrange_success", {
+        branch: "pending_driver_card",
+        customerId: cardTargetOrder.customerId,
+        driverUserId: userId
+      });
+    } catch (e) {
+      p1cDebug("customer_push_arrange_fail", {
+        branch: "pending_driver_card",
+        customerId: cardTargetOrder.customerId,
+        driverUserId: userId,
+        error: e?.message || String(e)
+      });
+      throw e;
+    }
+
+    p1cDebug("customer_push_card_before", {
+      branch: "pending_driver_card",
+      willPushCustomer: true,
+      customerId: cardTargetOrder.customerId,
+      driverUserId: userId,
+      hasValidCard: Boolean(String(text ?? "").trim()),
+      cardTextLength: String(text ?? "").length
+    });
+    try {
+      await pushText(cardTargetOrder.customerId, text);
+      p1cDebug("customer_push_card_success", {
+        branch: "pending_driver_card",
+        customerId: cardTargetOrder.customerId,
+        driverUserId: userId,
+        cardTextLength: String(text ?? "").length
+      });
+    } catch (e) {
+      p1cDebug("customer_push_card_fail", {
+        branch: "pending_driver_card",
+        customerId: cardTargetOrder.customerId,
+        driverUserId: userId,
+        error: e?.message || String(e)
+      });
+      throw e;
+    }
+    delete pendingDriver[cardTargetOrder.orderId];
+
+    return;
+  }
+
   const dispatcherMark = parseRsDispatcherMark(text);
   const waitingOrder = getWaitingOrderForDriverMessage(text, {
     isDispatcherMark: Boolean(dispatcherMark)
@@ -3291,70 +3357,6 @@ async function processDriverFleetGroupMessage(event, replyToken, userId, text, {
       await reply(replyToken, cardText);
       return;
     }
-
-    return;
-  }
-
-  const cardTargetOrder = getWaitingOrderByPendingDriver(userId);
-  if (cardTargetOrder) {
-    p1cDebug("branch_enter", {
-      branch: "pending_driver_card",
-      orderId: cardTargetOrder.orderId,
-      customerId: cardTargetOrder.customerId,
-      beforeStatus: cardTargetOrder.status,
-      userId,
-      driverUserId: userId,
-      willFinalizeMatched: true
-    });
-    const pending = pendingDriver[cardTargetOrder.orderId];
-    cardTargetOrder.status = "matched";
-    cardTargetOrder.driverId = userId;
-    cardTargetOrder.driverUserId = userId;
-    cardTargetOrder.driverEta = pending.time;
-
-    try {
-      await notifyCustomerDriverMatched(cardTargetOrder.customerId, userId, pending.time);
-      p1cDebug("customer_push_arrange_success", {
-        branch: "pending_driver_card",
-        customerId: cardTargetOrder.customerId,
-        driverUserId: userId
-      });
-    } catch (e) {
-      p1cDebug("customer_push_arrange_fail", {
-        branch: "pending_driver_card",
-        customerId: cardTargetOrder.customerId,
-        driverUserId: userId,
-        error: e?.message || String(e)
-      });
-      throw e;
-    }
-
-    p1cDebug("customer_push_card_before", {
-      branch: "pending_driver_card",
-      willPushCustomer: true,
-      customerId: cardTargetOrder.customerId,
-      driverUserId: userId,
-      hasValidCard: Boolean(String(text ?? "").trim()),
-      cardTextLength: String(text ?? "").length
-    });
-    try {
-      await pushText(cardTargetOrder.customerId, text);
-      p1cDebug("customer_push_card_success", {
-        branch: "pending_driver_card",
-        customerId: cardTargetOrder.customerId,
-        driverUserId: userId,
-        cardTextLength: String(text ?? "").length
-      });
-    } catch (e) {
-      p1cDebug("customer_push_card_fail", {
-        branch: "pending_driver_card",
-        customerId: cardTargetOrder.customerId,
-        driverUserId: userId,
-        error: e?.message || String(e)
-      });
-      throw e;
-    }
-    delete pendingDriver[cardTargetOrder.orderId];
 
     return;
   }
