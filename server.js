@@ -787,15 +787,22 @@ async function handleEvent(event) {
       // ===== Status inquiry gate P0-A-002：狀態追問不是新單 =====
       const isDriverInfoInquiry = detectDriverInfoInquiry(text);
       const driverInfoProbe = normalizeStatusInquiryProbe(text);
-      if (isDriverInfoInquiry || driverInfoProbe === "車") {
+      const latestForSingleCarProbe = driverInfoProbe === "車" ? getLatestCustomerOrder(userId) : null;
+      const latestStatusForSingleCarProbe = String(latestForSingleCarProbe?.status ?? "").toLowerCase();
+      const isContextualSingleCarInquiry =
+        driverInfoProbe === "車" &&
+        (Boolean(getActiveOrder(userId)) ||
+          latestStatusForSingleCarProbe === "canceled" ||
+          latestStatusForSingleCarProbe === "cancelled");
+      if (isDriverInfoInquiry || isContextualSingleCarInquiry || driverInfoProbe === "車") {
         p1cDebug("driver_info_inquiry_probe", {
           probe: driverInfoProbe,
-          hit: isDriverInfoInquiry,
+          hit: isDriverInfoInquiry || isContextualSingleCarInquiry,
           userId
         });
       }
-      if (isDriverInfoInquiry || detectStatusInquiry(text)) {
-        const statusMsg = isDriverInfoInquiry
+      if (isDriverInfoInquiry || isContextualSingleCarInquiry || detectStatusInquiry(text)) {
+        const statusMsg = isDriverInfoInquiry || isContextualSingleCarInquiry
           ? buildDriverInfoInquiryReply(userId)
           : buildStatusInquiryReply(userId);
         await reply(replyToken, statusMsg);
@@ -1840,9 +1847,13 @@ function detectDriverInfoInquiry(text) {
     "司機資訊再給我一次",
     "什麼司機資訊",
     "司機是誰",
+    "司機呢",
+    "司機",
     "車子資訊",
     "車型",
-    "車號"
+    "車號",
+    "車牌呢",
+    "車呢"
   ]).has(p);
 }
 
