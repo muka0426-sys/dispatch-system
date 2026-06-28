@@ -3044,6 +3044,33 @@ async function processDriverFleetGroupMessage(event, replyToken, userId, text, {
     return;
   }
 
+  const matchedOnboardOrder = getDriverOrderByStatus(userId, "matched");
+  if (matchedOnboardOrder && rsState.kind === "onboard") {
+    matchedOnboardOrder.status = "onboard";
+    matchedOnboardOrder.onboardAtMs = Date.now();
+    matchedOnboardOrder.updatedAtMs = matchedOnboardOrder.onboardAtMs;
+    await reply(replyToken, "收到，已記錄客上。");
+    return;
+  }
+
+  const outOfOrderDropoffOrder =
+    getDriverOrderByStatus(userId, "matched") ||
+    getDriverOrderByStatus(userId, "arrived");
+  if (outOfOrderDropoffOrder && rsState.kind === "dropoff") {
+    outOfOrderDropoffOrder.status = "done";
+    outOfOrderDropoffOrder.doneAtMs = Date.now();
+    outOfOrderDropoffOrder.completedAtMs = outOfOrderDropoffOrder.doneAtMs;
+    outOfOrderDropoffOrder.dropoffKm = rsState.km;
+    outOfOrderDropoffOrder.finalFare = rsState.fare;
+    if (outOfOrderDropoffOrder.rs?.arrivedTimer) {
+      clearTimeout(outOfOrderDropoffOrder.rs.arrivedTimer);
+      outOfOrderDropoffOrder.rs.arrivedTimer = null;
+    }
+    clearAlarm(outOfOrderDropoffOrder.orderId);
+    await reply(replyToken, "收到，已記錄客下，行程已完成。");
+    return;
+  }
+
   const cardTargetOrder = getWaitingOrderByPendingDriver(userId);
   if (cardTargetOrder) {
     p1cDebug("branch_enter", {
