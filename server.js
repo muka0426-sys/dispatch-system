@@ -590,6 +590,19 @@ async function handleEvent(event) {
       const state = getUserState(userId);
       const hasCarKeyword = text.includes("叫車") || text.includes("車");
 
+      const latestForTripCompletion = getLatestCustomerOrder(userId);
+      const latestTripStatus = String(latestForTripCompletion?.status ?? "").toLowerCase();
+      if (
+        (latestTripStatus === "onboard" || latestTripStatus === "done") &&
+        detectCustomerTripCompletionStatusText(text)
+      ) {
+        const msg = "收到，這筆行程已完成；若有費用或服務問題，我幫您轉人工確認。";
+        await reply(replyToken, msg);
+        appendConversationTurn(userId, "user", text);
+        appendConversationTurn(userId, "assistant", msg);
+        return;
+      }
+
       // ===== 最小安全版：客人取消攔截器 V3.6（必須在 appendConversationTurn 前）=====
       {
         // 只建立取消判斷用影子字串，不污染原始 text
@@ -1837,6 +1850,12 @@ function detectPureCustomerAck(text) {
   return new Set(["好", "好的", "收到", "ok", "了解", "嗯"]).has(p);
 }
 
+function detectCustomerTripCompletionStatusText(text) {
+  const t = String(text ?? "").trim();
+  if (!t) return false;
+  return /我.*下車了|都下車了|已經下車|已下車|下車了|行程已?結束|結束了|已到目的地/.test(t);
+}
+
 function detectDriverInfoInquiry(text) {
   const p = normalizeStatusInquiryProbe(text);
   if (!p) return false;
@@ -2959,58 +2978,15 @@ async function processDriverFleetGroupMessage(event, replyToken, userId, text, {
 
   const onboardDropOrder = getDriverOrderByStatus(userId, "onboard");
   if (onboardDropOrder && rsState.kind === "dropoff") {
-    const check = rsCheckOvercharge({ km: rsState.km, fare: rsState.fare });
-    penaltyTracker.onFareKnown({ orderId: onboardDropOrder.orderId, fare: rsState.fare });
-
-    const baselineFare = Number(onboardDropOrder?.estimatedRouteFare ?? NaN);
-    const baselineKm = Number(onboardDropOrder?.estimatedRouteKm ?? NaN);
-    const baselineValid = Number.isFinite(baselineFare) && baselineFare > 0 && Number.isFinite(baselineKm) && baselineKm > 0;
-    const reportedKm = Number(rsState.km);
-    const reportedFare = Number(rsState.fare);
-    const reportedValid = Number.isFinite(reportedKm) && reportedKm > 0 && Number.isFinite(reportedFare) && reportedFare > 0;
-
-    if (baselineValid && reportedValid) {
-      const diffFare = reportedFare - baselineFare;
-      const kmDeviationRate = Math.abs(reportedKm - baselineKm) / baselineKm;
-      const isAbnormal = diffFare > 30 || kmDeviationRate > 0.2;
-
-      if (isAbnormal) {
-        const prev = abnormalChargingDrivers.get(userId) || { count: 0, lastAtMs: 0 };
-        abnormalChargingDrivers.set(userId, { count: prev.count + 1, lastAtMs: Date.now() });
-
-        await reply(
-          replyToken,
-          `此趟行程費用 ($${reportedFare}) 與系統預估最短里程 ($${baselineFare}) 偏差較大，已轉交由行政人員進行人工審核結單。`
-        );
-
-        const adminMsg =
-          `【異常收費待審】\n` +
-          `司機編號：${userId}\n` +
-          `訂單：${onboardDropOrder.orderId}\n` +
-          `上車：${onboardDropOrder.pickup || onboardDropOrder.address || "未提供"}\n` +
-          `下車：${onboardDropOrder.dropoff || "未提供"}\n` +
-          `系統最短：${baselineKm}km / $${baselineFare}\n` +
-          `司機回報：${reportedKm}km / $${reportedFare}\n` +
-          `差額：$${Math.round(diffFare)}；里程偏差：${Math.round(kmDeviationRate * 100)}%`;
-        if (process.env.ADMIN_GROUP_ID) {
-          await pushText(process.env.ADMIN_GROUP_ID, adminMsg);
-        } else {
-          console.error("[ADMIN_GROUP_ID] unset, admin message:", adminMsg);
-        }
-
-        await appendLogicErrorLog({
-          title: "司機異常收費：差額>30或里程偏差>20%（真人審核）",
-          driverUserId: userId,
-          orderId: onboardDropOrder.orderId,
-          baselineKm,
-          baselineFare,
-          reportedKm,
-          reportedFare
-        });
-
-        return;
-      }
+    onboardDropOrder.status = "done";
+    onboardDropOrder.doneAtMs = Date.now();
+    onboardDropOrder.completedAtMs = onboardDropOrder.doneAtMs;
+    if (onboardDropOrder.rs?.arrivedTimer) {
+      clearTimeout(onboardDropOrder.rs.arrivedTimer);
+      onboardDropOrder.rs.arrivedTimer = null;
     }
+    clearAlarm(onboardDropOrder.orderId);
+    penaltyTracker.onFareKnown({ orderId: onboardDropOrder.orderId, fare: rsState.fare });
 
     const comp = penaltyTracker.computeCompensation({ orderId: onboardDropOrder.orderId });
     if (comp) {
@@ -3020,17 +2996,17 @@ async function processDriverFleetGroupMessage(event, replyToken, userId, text, {
       );
     }
 
-    if (!check.ok) {
-      await reply(replyToken, `注意：5/2直走表預估${check.expected}，你填${rsState.fare}疑似溢收+${check.diff}`);
-      return;
-    }
-    await reply(replyToken, `收到，5/2直走表預估${check.expected}，你填${rsState.fare}OK。`);
+    await reply(replyToken, "收到，行程已完成。");
     return;
   }
 
   const arrivedOnboardOrder = getDriverOrderByStatus(userId, "arrived");
   if (arrivedOnboardOrder && rsState.kind === "onboard") {
     arrivedOnboardOrder.status = "onboard";
+    if (arrivedOnboardOrder.rs?.arrivedTimer) {
+      clearTimeout(arrivedOnboardOrder.rs.arrivedTimer);
+      arrivedOnboardOrder.rs.arrivedTimer = null;
+    }
 
     await pushText(
       arrivedOnboardOrder.customerId,
@@ -3050,6 +3026,7 @@ async function processDriverFleetGroupMessage(event, replyToken, userId, text, {
     matchedArrivedOrder.rs = matchedArrivedOrder.rs || {};
     matchedArrivedOrder.rs.arrivedTimer = setTimeout(async () => {
       try {
+        if (matchedArrivedOrder.status !== "arrived") return;
         await pushText(
           matchedArrivedOrder.customerId,
           "司機已到點，提醒一下：超過5分鐘會開始等候費，1分鐘都是5元喲🥰"
